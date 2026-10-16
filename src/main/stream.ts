@@ -36,7 +36,8 @@ interface ActiveSession {
 
 const HLS_PORT = 47700;
 const IDLE_TIMEOUT_MS = 120_000;
-const MAX_SESSIONS = 6;
+const MAX_SESSIONS = 12; // eşzamanlı ffmpeg üst sınırı (process patlamasını önler)
+const ACQUIRE_TIMEOUT_MS = 25_000; // dolu ise en fazla bu kadar bekle
 const MIME: Record<string, string> = {
   '.m3u8': 'application/vnd.apple.mpegurl',
   '.ts': 'video/mp2t',
@@ -69,6 +70,36 @@ export class StreamEngine {
   private server: http.Server | null = null;
   private baseDir: string;
   private idleTimer: NodeJS.Timeout | null = null;
+  private waiters: Array<() => void> = [];
+
+  // ffmpeg slot semaforu — tavan dolduysa bekle (process patlaması yok).
+  private async acquireSlot(): Promise<void> {
+    if (this.sessions.size < MAX_SESSIONS) return;
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const t = setTimeout(() => {
+        if (done) return;
+        done = true;
+        const i = this.waiters.indexOf(fn);
+        if (i >= 0) this.waiters.splice(i, 1);
+        resolve();
+      }, ACQUIRE_TIMEOUT_MS);
+      const fn = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        resolve();
+      };
+      this.waiters.push(fn);
+    });
+  }
+
+  private pumpWaiters(): void {
+    while (this.waiters.length && this.sessions.size < MAX_SESSIONS) {
+      const fn = this.waiters.shift();
+      if (fn) fn();
+    }
+  }
 
   constructor() {
     this.baseDir = path.join(os.tmpdir(), 'oneview-streams');
@@ -227,6 +258,7 @@ export class StreamEngine {
     session.released = true;
     this.teardown(session);
     this.sessions.delete(sessionId);
+    this.pumpWaiters();
   }
 
   touch(sessionId: string): void {
@@ -253,6 +285,7 @@ export class StreamEngine {
   private async startHls(camera: CameraDescriptor): Promise<StreamSession> {
     this.ensureServer();
     this.ensureIdleSweep();
+    await this.acquireSlot(); // sert ffmpeg tavanı — doluysa bekle
 
     const sessionId = `s-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const dir = path.join(this.baseDir, sessionId);
@@ -283,6 +316,7 @@ export class StreamEngine {
           launch();
         } else {
           this.sessions.delete(sessionId);
+          this.pumpWaiters();
         }
       });
     };

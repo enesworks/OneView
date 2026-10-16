@@ -302,12 +302,9 @@ export async function runHealthCheck(
       offlineFail.delete(d.id);
       const since = offlineSince.get(d.id) || now;
       offlineSince.set(d.id, since);
-      if (now - since > 5 * 60_000) {
-        store.setDeviceStatus(d.id, 'DEAD', now);
-      } else {
-        store.setDeviceStatus(d.id, 'OFFLINE', now);
-      }
-      registry.update(d.id, { status: 'offline' });
+      store.setDeviceStatus(d.id, now - since > 5 * 60_000 ? 'DEAD' : 'OFFLINE', now);
+      // Registry'de YALNIZCA canlı kameralar kalır → çevrimdışı/ölü düşürülür (store'da kalır).
+      registry.purge((c) => c.id === d.id);
     }
   }
 }
@@ -815,7 +812,7 @@ export function registerEngineTasks(
   scheduler.register('mass-scan', async () => { await runMassScan(store, registry); }, 15_000, true);
   scheduler.register('exploit-pass', async () => { await runExploitPass(store, registry); }, 5 * 60_000, true);
   scheduler.register('thumbnail-gen', async () => { await runThumbnails(store); }, 5 * 60_000, false);
-  scheduler.register('health-check', async () => { await runHealthCheck(store, registry, engine); }, 30_000, false);
+  scheduler.register('health-check', async () => { await runHealthCheck(store, registry, engine); }, 15_000, false);
   scheduler.register('dead-retry', async () => { await runExploitPass(store, registry); }, 24 * 60 * 60_000, false);
   scheduler.register('public-scrape', async () => { await runPublicScrape(registry); }, 6 * 60 * 60_000, true);
   scheduler.register('geo-backfill', async () => { await runGeoBackfill(store); }, 30 * 60_000, true);
