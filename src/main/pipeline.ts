@@ -357,20 +357,33 @@ export async function runHealthCheck(
   // edilmiyorlardı → registry'de asla 'online' olmuyorlardı → AKTİF hep 0.
   // Artık: registry'deki TÜM url'li kayıtlar GERÇEK oynatma testinden geçer.
   const byId = new Map(store.listDevices().map((d) => [d.id, d]));
+  // Maliyet kontrolü: tur başına 8 kayıt, 2 eşzamanlı, 6sn test. (Eskiden 16 kayıt
+  // / 4 eşzamanlı / 9sn idi → ffmpeg havuzunu doldurup OYNATMAYI aç bırakıyordu.)
   const targets = registry
     .all()
     .filter((c) => c.url && c.protocol !== 'demo')
-    .slice(0, 16); // tur başına üst sınır (ffmpeg havuzu 6 ile sınırlı)
+    .slice(0, 8);
   const now = Date.now();
   let idx = 0;
-  const workers = Array.from({ length: Math.min(4, Math.max(targets.length, 1)) }, async () => {
+  const workers = Array.from({ length: Math.min(2, Math.max(targets.length, 1)) }, async () => {
     while (idx < targets.length) {
       const c = targets[idx++];
       const d = byId.get(c.id);
+      // Zaten online olan kamera için ffmpeg harcamayız (ucuz TCP kontrolü yeter) —
+      // yalnız 'unknown/offline' olanlar gerçek oynatma testinden geçer. Böylece
+      // health-check ffmpeg havuzunu doldurup OYNATMAYI aç bırakmaz.
+      if (c.status === 'online') {
+        const reachable = await engine.probe(c.url, 4000);
+        if (reachable) {
+          offlineFail.delete(c.id);
+          registry.update(c.id, { status: 'online', lastSeen: now });
+          continue;
+        }
+      }
       const plays =
         c.protocol === 'rtsp'
-          ? await verifyStream(c.url, 9000)
-          : await validateStream(c.url, c.protocol, 9000);
+          ? await verifyStream(c.url, 6000)
+          : await validateStream(c.url, c.protocol, 6000);
       if (plays) {
         offlineSince.delete(c.id);
         offlineFail.delete(c.id);
@@ -432,11 +445,14 @@ export async function runRegistryBackfill(store: CameraStore, registry: CameraRe
   });
   if (deadN > 0) console.log(`[Backfill] ${deadN} ölü kayıt arayüzden çıkarıldı`);
 
-  // 2) Store'daki bilinen (kimlik tutmuş) cihazları arayüze taşı.
+  // 2) Store'daki GERÇEKTEN oynayan (health-check 'LIVE' yapmış) cihazları taşı.
+  //    ⚠️ Eskiden 'ACCESSIBLE' de taşınıyordu → health-check'in oynamadığı için
+  //    attığı kamerayı backfill 60sn sonra GERİ EKLİYORDU (ikisi kavga ediyordu).
+  //    Artık: yalnız gerçek oynatma testinden geçmiş (LIVE) cihazlar arayüze girer.
   const fresh: RegisteredCamera[] = [];
   for (const d of store.listDevices()) {
     if (!d.url) continue;
-    if (d.status !== 'LIVE' && d.status !== 'ACCESSIBLE') continue;
+    if (d.status !== 'LIVE') continue;
     if (!geoAllowed(d.lat, d.lon)) continue;
     const cam = toRegistered(d);
     const cur = registry.get(cam.id);
@@ -1035,7 +1051,7 @@ export function registerEngineTasks(
   scheduler.register('registry-backfill', async () => { await runRegistryBackfill(store, registry); }, 60_000, true);
   scheduler.register('exploit-pass', async () => { await runExploitPass(store, registry); }, 5 * 60_000, true);
   scheduler.register('thumbnail-gen', async () => { await runThumbnails(store); }, 5 * 60_000, false);
-  scheduler.register('health-check', async () => { await runHealthCheck(store, registry, engine); }, 15_000, false);
+  scheduler.register('health-check', async () => { await runHealthCheck(store, registry, engine); }, 60_000, false);
   scheduler.register('dead-retry', async () => { await runExploitPass(store, registry); }, 24 * 60 * 60_000, false);
   scheduler.register('public-scrape', async () => { await runPublicScrape(registry); }, 6 * 60 * 60_000, true);
   scheduler.register('geo-backfill', async () => { await runGeoBackfill(store); }, 30 * 60_000, true);
