@@ -23,7 +23,7 @@ import { tryProprietaryAuth, dahuaRtspPath, hikRtspPath } from './proprietary';
 import { runCloudScan } from './cloud';
 import { onvifProbe, onvifStreams } from './onvif';
 import { internetDb } from './internetdb';
-import { validateBatch } from './validate';
+import { validateBatch, validateStream } from './validate';
 
 const WEB_PORTS = new Set([80, 8080, 8000]);
 const offlineSince = new Map<string, number>();
@@ -352,29 +352,45 @@ export async function runHealthCheck(
   registry: CameraRegistry,
   engine: StreamEngine,
 ): Promise<void> {
-  const live = store.listDevices('LIVE');
+  // ⚠️ ESKİDEN sadece store'da 'LIVE' olanlar kontrol ediliyordu. Bizim kameralar
+  // store'da 'ACCESSIBLE' (tarama anında video doğrulanmamış) → HİÇ kontrol
+  // edilmiyorlardı → registry'de asla 'online' olmuyorlardı → AKTİF hep 0.
+  // Artık: registry'deki TÜM url'li kayıtlar GERÇEK oynatma testinden geçer.
+  const byId = new Map(store.listDevices().map((d) => [d.id, d]));
+  const targets = registry
+    .all()
+    .filter((c) => c.url && c.protocol !== 'demo')
+    .slice(0, 16); // tur başına üst sınır (ffmpeg havuzu 6 ile sınırlı)
   const now = Date.now();
-
-  for (const d of live) {
-    const url = d.url || `rtsp://${d.ip}:${d.port}`;
-    const reachable = await engine.probe(url, 5000);
-    if (reachable) {
-      offlineSince.delete(d.id);
-      offlineFail.delete(d.id);
-      store.setDeviceStatus(d.id, 'LIVE', now);
-      registry.update(d.id, { status: 'online', lastSeen: now });
-    } else {
-      const fails = (offlineFail.get(d.id) || 0) + 1;
-      offlineFail.set(d.id, fails);
-      if (fails < 2) continue; // geçici kopma — hemen offline basma
-      offlineFail.delete(d.id);
-      const since = offlineSince.get(d.id) || now;
-      offlineSince.set(d.id, since);
-      store.setDeviceStatus(d.id, now - since > 5 * 60_000 ? 'DEAD' : 'OFFLINE', now);
-      // Registry'de YALNIZCA canlı kameralar kalır → çevrimdışı/ölü düşürülür (store'da kalır).
-      registry.purge((c) => c.id === d.id);
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(4, Math.max(targets.length, 1)) }, async () => {
+    while (idx < targets.length) {
+      const c = targets[idx++];
+      const d = byId.get(c.id);
+      const plays =
+        c.protocol === 'rtsp'
+          ? await verifyStream(c.url, 9000)
+          : await validateStream(c.url, c.protocol, 9000);
+      if (plays) {
+        offlineSince.delete(c.id);
+        offlineFail.delete(c.id);
+        if (d) store.setDeviceStatus(d.id, 'LIVE', now);
+        registry.update(c.id, { status: 'online', lastSeen: now });
+      } else {
+        const fails = (offlineFail.get(c.id) || 0) + 1;
+        offlineFail.set(c.id, fails);
+        if (fails < 2) continue; // geçici kopma — hemen offline basma
+        offlineFail.delete(c.id);
+        const since = offlineSince.get(c.id) || now;
+        offlineSince.set(c.id, since);
+        if (d) store.setDeviceStatus(d.id, now - since > 5 * 60_000 ? 'DEAD' : 'OFFLINE', now);
+        // Registry'de yalnızca oynayan kameralar kalır (store'da kayıt kalır).
+        registry.purge((x) => x.id === c.id);
+      }
     }
-  }
+  });
+  await Promise.all(workers);
+  registry.save();
 }
 
 export async function runThumbnails(store: CameraStore): Promise<number> {

@@ -85,7 +85,7 @@ export default function CameraListPanel({ cameras, selectedId, onSelect }: Props
               </div>
               <div className="cam-row-id mono">TR-{String(i + 1).padStart(3, '0')}</div>
             </div>
-            {c.verified && <span className="cam-live">LIVE</span>}
+            {c.status === 'online' && <span className="cam-live">LIVE</span>}
             <span className={`cam-status ${c.status}`}>
               <span className="dot" />
               {STATUS_LABEL[c.status]}
