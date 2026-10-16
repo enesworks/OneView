@@ -450,10 +450,14 @@ export async function runRegistryBackfill(store: CameraStore, registry: CameraRe
   //    ⚠️ Eskiden 'ACCESSIBLE' de taşınıyordu → health-check'in oynamadığı için
   //    attığı kamerayı backfill 60sn sonra GERİ EKLİYORDU (ikisi kavga ediyordu).
   //    Artık: yalnız gerçek oynatma testinden geçmiş (LIVE) cihazlar arayüze girer.
+  // Arayüz BOŞ KALMASIN: kimlik tutmuş (url'li) cihazlar 'unknown' (gri) gösterilir.
+  // Health-check gerçek oynatma testinden geçirirse 'online' (yeşil) olur; geçmezse
+  // gri kalır ya da düşer. Eskiden ACCESSIBLE'lar yanlışlıkla 'online' görünüyordu;
+  // artık health-check ffmpeg ile doğruladığı için gri/yeşil ayrımı DÜRÜST.
   const fresh: RegisteredCamera[] = [];
   for (const d of store.listDevices()) {
     if (!d.url) continue;
-    if (d.status !== 'LIVE') continue;
+    if (d.status !== 'LIVE' && d.status !== 'ACCESSIBLE') continue;
     if (!geoAllowed(d.lat, d.lon)) continue;
     const cam = toRegistered(d);
     const cur = registry.get(cam.id);
