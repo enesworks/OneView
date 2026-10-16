@@ -37,9 +37,14 @@ export function censysToken(): string {
 const SHODAN_QUERIES = [
   'country:TR port:554',
   'country:TR port:8554',
+  'country:TR port:10554',
+  'country:TR port:8000',
+  'country:TR port:37777',
   'country:TR port:8080 has_screenshot:true',
   'country:TR port:81 has_screenshot:true',
+  'country:TR title:"NETSurveillance WEB"',
 ];
+const SHODAN_PAGES = 3; // sorgu başına 3 sayfa (100'er sonuç) → binlerce cihaz
 
 interface Host {
   ip: string;
@@ -54,31 +59,35 @@ export async function shodanHosts(apiKey: string): Promise<Host[]> {
   if (!apiKey) return out;
 
   for (const q of SHODAN_QUERIES) {
-    try {
-      const url =
-        `https://api.shodan.io/shodan/host/search?key=${encodeURIComponent(apiKey)}` +
-        `&query=${encodeURIComponent(q)}&minify=true`;
-      const res = await fetch(url, { headers: { Accept: 'application/json' } });
-      if (!res.ok) continue;
-      const data = (await res.json()) as {
-        matches?: Array<{ ip_str?: string; port?: number; location?: { latitude?: number; longitude?: number } }>;
-      };
-      for (const m of data?.matches || []) {
-        const ip = m.ip_str;
-        const port = m.port;
-        if (!ip || !port) continue;
-        const key = `${ip}:${port}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        out.push({
-          ip,
-          port,
-          lat: m.location?.latitude ?? 0,
-          lon: m.location?.longitude ?? 0,
-        });
+    for (let page = 1; page <= SHODAN_PAGES; page++) {
+      try {
+        const url =
+          `https://api.shodan.io/shodan/host/search?key=${encodeURIComponent(apiKey)}` +
+          `&query=${encodeURIComponent(q)}&minify=true&page=${page}`;
+        const res = await fetch(url, { headers: { Accept: 'application/json' } });
+        if (!res.ok) break;
+        const data = (await res.json()) as {
+          matches?: Array<{ ip_str?: string; port?: number; location?: { latitude?: number; longitude?: number } }>;
+        };
+        const matches = data?.matches || [];
+        if (!matches.length) break; // son sayfa
+        for (const m of matches) {
+          const ip = m.ip_str;
+          const port = m.port;
+          if (!ip || !port) continue;
+          const key = `${ip}:${port}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({
+            ip,
+            port,
+            lat: m.location?.latitude ?? 0,
+            lon: m.location?.longitude ?? 0,
+          });
+        }
+      } catch {
+        break; /* sorgu hatası → sonraki sorgu */
       }
-    } catch {
-      /* ignore query */
     }
   }
   return out;

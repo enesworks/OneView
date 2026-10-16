@@ -29,6 +29,8 @@ Tek bir motor çalıştırır: **RIPE tabanlı ülke taraması → servis parmak
 - **Proprietary portlar** — `37777` (Dahua), `8000` (Hikvision SDK).
 - **Banner parmak izi** — `Server` başlığı, `WWW-Authenticate` realm, sayfa başlığı.
 - **RTSP banner parmak izi** — `Server` + `realm` ile üretici tespiti (Dahua, Hikvision, Axis, Amcrest, Foscam, Reolink, Vivotek, Uniview …).
+- **InternetDB (anahtarsız)** — bulunan IP'nin tüm açık portlarını ücretsiz sorgular; kaçırılan kamera portlarını yakalar.
+- **ONVIF** — WS-Discovery + `GetProfiles` / `GetStreamUri` (WS-Security UsernameToken Digest); üreticiden bağımsız doğrudan RTSP adresi.
 
 ### 🔐 Kimlik Doğrulama (Auth)
 - **RTSP** — `OPTIONS` + `DESCRIBE` tabanlı gerçek doğrulama; Basic ve Digest şemaları.
@@ -98,6 +100,8 @@ Tek bir motor çalıştırır: **RIPE tabanlı ülke taraması → servis parmak
 | | `recon.ts` | TCP tarama, banner toplama, vendor doğrulama |
 | | `massscan.ts` | Yüksek eşzamanlı port tarama, RTSP auth, kimlik havuzu, hız sınırı |
 | | `proprietary.ts` | Dahua `37777` · Hikvision `8000` özel protokoller |
+| | `onvif.ts` | WS-Discovery · `GetProfiles` · `GetStreamUri` (WS-Security Digest) |
+| | `internetdb.ts` | Ücretsiz (anahtarsız) per-IP port/zafiyet zenginleştirme |
 | **Sızma** | `intrusion.ts` | Parser/auth akışları, yerel keşif (SADP/SSDP), path brute |
 | | `exploits.ts` | CVE zincirleri, DVR traversal, `magicBox` |
 | | `vendor-auth.ts` | Hikvision ISAPI · Dahua RPC2 |
