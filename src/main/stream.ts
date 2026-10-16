@@ -214,6 +214,8 @@ export class StreamEngine {
   }
 
   async acquire(camera: CameraDescriptor): Promise<StreamSession> {
+    // Boş url ile ffmpeg'e gidiyordu → "Error opening input file ." (loglarda kanıtlı).
+    if (!camera.url) throw new Error('kameranın yayın adresi yok');
     if (camera.protocol === 'hls' && camera.url) {
       this.ensureServer();
       return {
@@ -305,7 +307,18 @@ export class StreamEngine {
     };
     this.sessions.set(sessionId, session);
 
+    let exhausted = false; // ffmpeg yeniden başlatma bütçesi bitti mi?
     const launch = (): void => {
+      // Yeniden başlatmada BAYAT playlist/segment kalmasın → hls.js'in medya
+      // sequence'ı karışıp oynatma çökmüyordu ("1dk izledim sonra error").
+      if (session.restarts > 0) {
+        try {
+          fs.rmSync(dir, { recursive: true, force: true });
+          fs.mkdirSync(dir, { recursive: true });
+        } catch {
+          /* noop */
+        }
+      }
       const p = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
       const errLog = fs.createWriteStream(path.join(dir, 'ffmpeg.log'), { flags: 'a' });
       p.stderr?.pipe(errLog);
@@ -315,6 +328,10 @@ export class StreamEngine {
           session.restarts++;
           launch();
         } else {
+          // Bütçe bitti → oturumu SESSİZCE silmek yerine ölü işaretle ve temizle.
+          exhausted = true;
+          session.released = true;
+          this.rmSafe(dir);
           this.sessions.delete(sessionId);
           this.pumpWaiters();
         }
@@ -328,8 +345,16 @@ export class StreamEngine {
       this.release(oldest[0]);
     }
 
-    // 15sn YETMİYORDU: H.265/4K kamerada ilk segment gecikiyordu → "transcode timeout".
-    await this.waitForFile(out, 25000);
+    try {
+      // 25sn üst sınır ama ffmpeg ölürse ANINDA hata (ölü kamerada 15-30sn bekleme biter).
+      await this.waitForFile(out, 25000, () => exhausted);
+    } catch (err) {
+      session.released = true;
+      this.teardown(session);
+      this.sessions.delete(sessionId);
+      this.pumpWaiters();
+      throw err;
+    }
 
     return {
       sessionId,
@@ -426,7 +451,7 @@ export class StreamEngine {
     }
   }
 
-  private waitForFile(file: string, timeoutMs: number): Promise<void> {
+  private waitForFile(file: string, timeoutMs: number, aborted?: () => boolean): Promise<void> {
     const start = Date.now();
     return new Promise((resolve, reject) => {
       const tick = () => {
@@ -435,6 +460,9 @@ export class StreamEngine {
         } catch {
           /* retry */
         }
+        // ERKEN ÇIKIŞ: ffmpeg öldüyse 25sn beklemek anlamsız → hata ANINDA döner.
+        // ("bağlanılıyor" ekranı 25sn asılı kalıyordu; ölü kamerada ~2sn olur.)
+        if (aborted?.()) return reject(new Error('yayın açılamadı (kamera yayın vermedi)'));
         if (Date.now() - start > timeoutMs) return reject(new Error('transcode timeout'));
         setTimeout(tick, 150);
       };

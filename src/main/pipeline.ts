@@ -407,6 +407,15 @@ export async function runRegistryBackfill(store: CameraStore, registry: CameraRe
   const dropped = registry.purge((c) => !geoAllowed(c.lat, c.lon));
   if (dropped > 0) console.log(`[Backfill] ${dropped} yabancı kayıt arayüzden çıkarıldı`);
 
+  // 1b) Store'da ÖLÜ işaretlenmiş kayıtları arayüzden düş — tıklanınca hata veren
+  //     bayat kameralar listeyi kirletmesin (health-check bunları OFFLINE yapar).
+  const byId = new Map(store.listDevices().map((d) => [d.id, d]));
+  const deadN = registry.purge((c) => {
+    const d = byId.get(c.id);
+    return !!d && (d.status === 'OFFLINE' || d.status === 'DEAD');
+  });
+  if (deadN > 0) console.log(`[Backfill] ${deadN} ölü kayıt arayüzden çıkarıldı`);
+
   // 2) Store'daki bilinen (kimlik tutmuş) cihazları arayüze taşı.
   const fresh: RegisteredCamera[] = [];
   for (const d of store.listDevices()) {

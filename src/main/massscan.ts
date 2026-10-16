@@ -342,7 +342,51 @@ function rememberRealm(realm: string, u: string, p: string): void {
   REALM_CREDS.set(realm, list);
 }
 
-// DESCRIBE sonucu: ok=200 · deny=401/403 (cihaz canlı) · none=yanıt yok (blok/kilit) + realm
+// GERÇEK doğrulama: DESCRIBE 200+SDP bile yanıltıcı çıkıyor (kanıt: 78.161.95.254
+// DESCRIBE'da SDP döndü ama ffmpeg'de "SETUP failed: 404 Stream Not Found").
+// SETUP 200/461 = stream gerçekten var ve oynatılabilir (ffmpeg'in ilk adımı).
+function rtspSetupOk(
+  host: string,
+  port: number,
+  path: string,
+  user: string,
+  pass: string,
+  timeoutMs = 2500,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const s = new net.Socket();
+    let done = false;
+    let all = '';
+    const fin = (v: boolean) => {
+      if (done) return;
+      done = true;
+      try {
+        s.destroy();
+      } catch {
+        /* noop */
+      }
+      resolve(v);
+    };
+    s.setNoDelay(true);
+    s.setTimeout(timeoutMs, () => fin(false));
+    s.once('connect', () => {
+      let req = `SETUP rtsp://${host}:${port}${path} RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nUser-Agent: OneView/2.0\r\n`;
+      if (user) req += `Authorization: ${basicAuth(user, pass)}\r\n`;
+      req += '\r\n';
+      s.write(req);
+    });
+    s.once('error', () => fin(false));
+    s.on('data', (d) => {
+      all += d.toString('utf8');
+      const m = /^RTSP\/1\.0 (\d{3})/i.exec(all);
+      if (m) fin(m[1] === '200' || m[1] === '461'); // 461 = transport uyumsuz ama stream VAR
+    });
+    s.connect(port, host);
+  });
+}
+
+// ⚠️ 200 ama SDP yok = sahte: cihaz auth'u kabul ediyor ama o path'te stream yok
+// (ffmpeg'de "SETUP failed: 404 Stream Not Found" olarak patlıyordu — loglarda kanıtlı).
 function rtspTryStatus(
   host: string,
   port: number,
@@ -354,11 +398,15 @@ function rtspTryStatus(
   return new Promise((resolve) => {
     const s = new net.Socket();
     let done = false;
-    const fin = (status: 'ok' | 'deny' | 'none', realm = '') => {
+    let all = '';
+    let waitSdp: NodeJS.Timeout | null = null;
+    const realmOf = () => (/realm="([^"]*)"/i.exec(all) || [])[1] || '';
+    const fin = (status: 'ok' | 'deny' | 'none') => {
       if (done) return;
       done = true;
+      if (waitSdp) clearTimeout(waitSdp);
       s.destroy();
-      resolve({ status, realm });
+      resolve({ status, realm: realmOf() });
     };
     s.setNoDelay(true);
     s.setTimeout(timeoutMs, () => fin('none'));
@@ -370,16 +418,21 @@ function rtspTryStatus(
     });
     s.once('error', () => fin('none'));
     s.on('data', (buf) => {
-      const t = buf.toString('utf8');
-      const realm = (/realm="([^"]*)"/i.exec(t) || [])[1] || '';
-      if (/^RTSP\/1\.0 200/i.test(t)) fin('ok', realm);
-      else if (/^RTSP\/1\.0 \d/i.test(t)) fin('deny', realm);
+      all += buf.toString('utf8');
+      if (/^RTSP\/1\.0 200/i.test(all)) {
+        if (/v=0\r?\n|m=video/i.test(all)) fin('ok');
+        else if (!waitSdp) waitSdp = setTimeout(() => fin('none'), 600); // SDP'ye 600ms tanı
+      } else if (/^RTSP\/1\.0 \d/i.test(all)) {
+        fin('deny');
+      }
     });
     s.connect(port, host);
   });
 }
 
-const MAX_CRED_TRIES = 150; // cihaz başına üst sınır (aşırı denemeyi kısar)
+// ⚠️ 150 → 40: Hikvision/Dahua ~10 hatalı denemeden sonra KİLİTLENİR ve her cred'e
+// 401 döner. Tarama, o anda oynayan çalışan kamerayı da kilitleyip düşürüyordu.
+const MAX_CRED_TRIES = 40;
 export async function quickRtsp(
   host: string,
   port = 554,
@@ -422,15 +475,24 @@ export async function quickRtsp(
     }
     if (res === 'ok') {
       rememberRealm(rl, u, p);
-      for (const path of orderedPaths()) {
-        if (await rtspTry(host, port, path, u, p, timeoutMs)) {
+      const authPart = u ? `${encodeURIComponent(u)}:${encodeURIComponent(p)}@` : '';
+      // SETUP ile GERÇEK doğrulama. (Eskiden DESCRIBE yeterli sayılıp SDP'siz/
+      // SETUP'sız URL kaydediliyordu → arayüzde "hata veren kameralar" oluşuyordu.)
+      for (const path of PROBE) {
+        if (await rtspSetupOk(host, port, path, u, p, timeoutMs)) {
           rememberPath(path);
-          const authPart = u ? `${encodeURIComponent(u)}:${encodeURIComponent(p)}@` : '';
           return { url: `rtsp://${authPart}${host}:${port}${path}`, user: u, pass: p };
         }
       }
-      const authPart = u ? `${encodeURIComponent(u)}:${encodeURIComponent(p)}@` : '';
-      return { url: `rtsp://${authPart}${host}:${port}${PROBE[0]}`, user: u, pass: p };
+      for (const path of orderedPaths()) {
+        if (await rtspSetupOk(host, port, path, u, p, timeoutMs)) {
+          rememberPath(path);
+          return { url: `rtsp://${authPart}${host}:${port}${path}`, user: u, pass: p };
+        }
+      }
+      // SETUP hiç tutmadı → sahte pozitif. Kaydetme, sonraki cred'e geç.
+      consecutiveNone++;
+      continue;
     }
     if (res === 'none') consecutiveNone++;
     else consecutiveNone = 0; // deny → cihaz canlı, kilit yok
