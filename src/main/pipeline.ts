@@ -35,19 +35,24 @@ const geoLocator = new GeoLocator();
 // stream.ts'te MAX_SESSIONS=12 var ama verifyStream/snapshotJpeg SINIRSIZDI.
 // 60 RTSP worker'ı aynı anda ffmpeg açıyordu → makine boğuluyor → gerçek kamera
 // bile 6sn timeout'u aşıyordu (canlı test: tek kamera 4858ms) → LIVE hiç olmuyordu.
+// ÖNCELİKLİ ffmpeg havuzu: kullanıcı oynatması ve health-check yüksek öncelikli,
+// mass-scan'in toplu doğrulamaları düşük öncelikli. Aksi halde kütle taraması
+// slotları tutup health-check'i geciktiriyor → ÇALIŞAN kamera yanlışlıkla
+// 'OFFLINE' damgası yiyordu (kanıt: 4 kamera 620 KB kare verirken OFFLINE göründü).
 const FFMPEG_MAX = 6;
 let ffmpegRunning = 0;
-const ffmpegWaiters: Array<() => void> = [];
-function acquireFfmpeg(): Promise<void> {
+const ffmpegHigh: Array<() => void> = [];
+const ffmpegLow: Array<() => void> = [];
+function acquireFfmpeg(high = false): Promise<void> {
   if (ffmpegRunning < FFMPEG_MAX) {
     ffmpegRunning++;
     return Promise.resolve();
   }
-  return new Promise((res) => ffmpegWaiters.push(res));
+  return new Promise((res) => (high ? ffmpegHigh : ffmpegLow).push(res));
 }
 function releaseFfmpeg(): void {
   ffmpegRunning = Math.max(0, ffmpegRunning - 1);
-  const next = ffmpegWaiters.shift();
+  const next = ffmpegHigh.shift() || ffmpegLow.shift();
   if (next) {
     ffmpegRunning++;
     next();
@@ -68,8 +73,8 @@ function noteFfmpegErr(t: string): void {
   if (line) lastFfmpegErr = line.slice(0, 200);
 }
 
-async function verifyStream(url: string, timeoutMs = 15000): Promise<boolean> {
-  await acquireFfmpeg();
+async function verifyStream(url: string, timeoutMs = 15000, high = false): Promise<boolean> {
+  await acquireFfmpeg(high);
   try {
     return await new Promise<boolean>((resolve) => {
       const proc = spawn(
@@ -363,7 +368,7 @@ export async function runHealthCheck(
   const targets = registry
     .all()
     .filter((c) => c.url && c.protocol !== 'demo')
-    .slice(0, 8);
+    .slice(0, 24); // tüm kayıtlar her turda test edilsin (öncelikli slot + 2 paralel)
   const now = Date.now();
   let idx = 0;
   const workers = Array.from({ length: Math.min(2, Math.max(targets.length, 1)) }, async () => {
@@ -383,7 +388,7 @@ export async function runHealthCheck(
       }
       const plays =
         c.protocol === 'rtsp'
-          ? await verifyStream(c.url, 12000)
+          ? await verifyStream(c.url, 12000, true)
           : await validateStream(c.url, c.protocol, 12000);
       if (plays) {
         offlineSince.delete(c.id);
