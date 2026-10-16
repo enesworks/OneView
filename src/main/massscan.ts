@@ -329,16 +329,36 @@ export interface QuickRtspResult {
   pass: string;
 }
 
-// DESCRIBE sonucu: ok=200 · deny=401/403 (cihaz canlı) · none=yanıt yok (blok/muhtemelen kilitli)
-function rtspTryStatus(host: string, port: number, path: string, user: string, pass: string, timeoutMs: number): Promise<'ok' | 'deny' | 'none'> {
+// Realm → tutan kimlik (oturum içi öğrenme — "B" maddesi).
+const REALM_CREDS = new Map<string, Array<[string, string]>>();
+export function realmHot(realm: string): Array<[string, string]> {
+  return realm ? REALM_CREDS.get(realm) || [] : [];
+}
+function rememberRealm(realm: string, u: string, p: string): void {
+  if (!realm) return;
+  const list = REALM_CREDS.get(realm) || [];
+  if (!list.some(([a, b]) => a === u && b === p)) list.unshift([u, p]);
+  if (list.length > 8) list.pop();
+  REALM_CREDS.set(realm, list);
+}
+
+// DESCRIBE sonucu: ok=200 · deny=401/403 (cihaz canlı) · none=yanıt yok (blok/kilit) + realm
+function rtspTryStatus(
+  host: string,
+  port: number,
+  path: string,
+  user: string,
+  pass: string,
+  timeoutMs: number,
+): Promise<{ status: 'ok' | 'deny' | 'none'; realm: string }> {
   return new Promise((resolve) => {
     const s = new net.Socket();
     let done = false;
-    const fin = (v: 'ok' | 'deny' | 'none') => {
+    const fin = (status: 'ok' | 'deny' | 'none', realm = '') => {
       if (done) return;
       done = true;
       s.destroy();
-      resolve(v);
+      resolve({ status, realm });
     };
     s.setNoDelay(true);
     s.setTimeout(timeoutMs, () => fin('none'));
@@ -351,30 +371,57 @@ function rtspTryStatus(host: string, port: number, path: string, user: string, p
     s.once('error', () => fin('none'));
     s.on('data', (buf) => {
       const t = buf.toString('utf8');
-      if (/^RTSP\/1\.0 200/i.test(t)) fin('ok');
-      else if (/^RTSP\/1\.0 \d/i.test(t)) fin('deny');
+      const realm = (/realm="([^"]*)"/i.exec(t) || [])[1] || '';
+      if (/^RTSP\/1\.0 200/i.test(t)) fin('ok', realm);
+      else if (/^RTSP\/1\.0 \d/i.test(t)) fin('deny', realm);
     });
     s.connect(port, host);
   });
 }
 
 const MAX_CRED_TRIES = 150; // cihaz başına üst sınır (aşırı denemeyi kısar)
-export async function quickRtsp(host: string, port = 554, timeoutMs = 2000): Promise<QuickRtspResult | null> {
+export async function quickRtsp(
+  host: string,
+  port = 554,
+  timeoutMs = 2000,
+  hint: Array<[string, string]> = [],
+): Promise<QuickRtspResult | null> {
   // DESCRIBE tabanlı cred testi + path keşfi. 500+ cred, GLOBAL hız sınırlı (80/sn).
-  // KİLİT KORUMASI: cihaz art arda 5 kez hiç yanıt vermezse (blok/kilit) dur.
+  // Sıra: realm-hot → global hot-list (öğrenilmiş) → tam havuz. Kilit koruması açık.
   const PROBE = ['/Streaming/Channels/101', '/cam/realmonitor?channel=1&subtype=0', '/onvif1'];
+
+  // Realm keşfi (auth'suz tek DESCRIBE) — aynı realm'de tutan kimlik öne gelir.
+  const first = await rtspTryStatus(host, port, PROBE[0], '', '', timeoutMs);
+  const realm = first.realm || '';
+
+  const ordered: Array<[string, string]> = [];
+  const seenC = new Set<string>();
+  const pushC = (u: string, p: string) => {
+    const k = `${u}:${p}`;
+    if (seenC.has(k)) return;
+    seenC.add(k);
+    ordered.push([u, p]);
+  };
+  for (const [u, p] of realmHot(realm)) pushC(u, p);
+  for (const [u, p] of hint) pushC(u, p);
+  for (const [u, p] of MASS_CREDS) pushC(u, p);
+
   let tries = 0;
   let consecutiveNone = 0;
-  for (const [u, p] of MASS_CREDS) {
+  for (const [u, p] of ordered) {
     if (tries >= MAX_CRED_TRIES || consecutiveNone >= 5) break;
     await credLimiter.wait();
     tries++;
     let res: 'ok' | 'deny' | 'none' = 'none';
+    let rl = realm;
     for (const path of PROBE) {
-      res = await rtspTryStatus(host, port, path, u, p, timeoutMs);
+      const st = await rtspTryStatus(host, port, path, u, p, timeoutMs);
+      res = st.status;
+      if (st.realm) rl = st.realm;
       if (res !== 'deny') break;
     }
     if (res === 'ok') {
+      rememberRealm(rl, u, p);
       for (const path of orderedPaths()) {
         if (await rtspTry(host, port, path, u, p, timeoutMs)) {
           rememberPath(path);

@@ -194,7 +194,10 @@ export class ScanQueue {
   }
 }
 
-export async function buildScanQueue(hitIps: string[] = []): Promise<ScanQueue> {
+export async function buildScanQueue(
+  hitIps: string[] = [],
+  scanCounts: Map<number, number> = new Map(),
+): Promise<ScanQueue> {
   const q = new ScanQueue();
   const seen = new Set<string>();
 
@@ -216,12 +219,18 @@ export async function buildScanQueue(hitIps: string[] = []): Promise<ScanQueue> 
     seen.add(p);
     const { start, end } = prefixToRange(p);
     let h = 0;
+    let sc = 0;
     const s16 = start >>> 16;
     const e16 = end >>> 16;
-    for (let k = s16; k <= e16 && k - s16 < 8192; k++) h += hits.get(k) || 0;
+    for (let k = s16; k <= e16 && k - s16 < 8192; k++) {
+      h += hits.get(k) || 0;
+      sc += scanCounts.get(k) || 0;
+    }
     const size = end - start + 1;
     const density = h === 0 ? 0 : (h / size) * 1e6; // isabet / milyon IP
-    q.push(p, 'TR', 1, density);
+    // COOLDOWN (C): taranmış ama hiç isabet vermemiş prefix → en sona atılır.
+    const dead = h === 0 && sc >= 256;
+    q.push(p, 'TR', 1, dead ? -1 : density);
   }
 
   return q;

