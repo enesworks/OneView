@@ -1,0 +1,25 @@
+{
+  "appId": "com.enesworks.oneview",
+  "productName": "OneView",
+  "directories": {
+    "output": "release",
+    "buildResources": "resources"
+  },
+  "files": [
+    "dist/**/*",
+    "dist-electron/**/*"
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "portable",
+        "arch": ["x64"]
+      }
+    ],
+    "icon": "resources/atam.ico",
+    "artifactName": "OneView.${ext}"
+  },
+  "portable": {
+    "artifactName": "OneView.exe"
+  }
+}

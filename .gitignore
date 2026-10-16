@@ -1,0 +1,12 @@
+node_modules
+dist
+dist-electron
+release
+*.log
+.DS_Store
+
+# yerel derleme/paketleme çıktıları ve notlar
+*.txt
+sources.sample.*
+KAYNAKLAR.md
+*.tmp
