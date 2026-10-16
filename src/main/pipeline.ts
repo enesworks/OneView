@@ -547,10 +547,10 @@ export async function runMassScan(
       const ip = t.ip;
       const port = t.port;
 
-      // GEO önce: yabancı IP ise RTSP auth'a hiç girme, kaydetme, registry'ye alma.
+      // GEO: ülke ADI yerine SINIR KUTUSU. (ip-api bazen TR IP'ye "Flanders" gibi
+      // yanlış country döndürüp ÇALIŞAN kamerayı eliyordu.) Konum yoksa eleme YOK.
       const geo = await geoLocator.resolve(ip);
-      const isTr = !geo?.country || /türkiye|turkey|^tr$/i.test(geo.country);
-      if (!isTr) {
+      if (!geoAllowed(geo?.lat ?? 0, geo?.lon ?? 0)) {
         processed++;
         if (processed % 10 === 0) {
           registry.save();
@@ -672,7 +672,7 @@ export async function runMassScan(
     const ffErr = lastFfmpegError();
     fs.appendFileSync(
       path.join(app.getPath('userData'), 'scan.log'),
-      `${new Date().toISOString()} batch=${ips.length} rtspOpen=${openIps.length} urlOk=${urlOk} httpCve=${cveLive} proprietary=${propLive} live=${live} reg=${registry.all().length} cursor=${pos.rangeIdx}/${pos.cursor} ffmpeg=${ffErr || 'ok'}\n`,
+      `${new Date().toISOString()} batch=${ips.length} rtspOpen=${openIps.length} urlOk=${urlOk} httpCve=${cveLive} proprietary=${propLive} live=${live} reg=${registry.all().length} cursor=${pos.cidr}@${pos.cursor} ffmpeg=${ffErr || 'ok'}\n`,
     );
   } catch {
     /* noop */

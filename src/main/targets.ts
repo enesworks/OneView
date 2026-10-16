@@ -130,16 +130,32 @@ export class ScanQueue {
     return total;
   }
 
-  getPosition(): { rangeIdx: number; cursor: number } {
-    return { rangeIdx: this.rangeIdx, cursor: this.cursor };
+  // ⚠️ ARTIK CIDR ile konumlanır (index DEĞİL): kuyruk her döngüde yoğunluğa/
+  // "ölü prefix" durumuna göre YENİDEN SIRALANIYOR. Eskiden index'e güveniliyordu →
+  // sıra değişince imleç başka prefix'e uygulanıyor, next() milyarlarca IP'lik
+  // sapma yapıyor ve tarama aynı bloğa KİLİTLENİYORDU (uzun koşuda 0 yeni kamera).
+  getPosition(): { cidr: string; cursor: number } {
+    const r = this.ranges[this.rangeIdx];
+    return { cidr: r ? r.cidr : '', cursor: this.cursor };
   }
 
-  restore(pos: { rangeIdx: number; cursor: number }): void {
-    this.rangeIdx = Math.min(pos.rangeIdx, this.ranges.length);
+  restore(pos: { cidr?: string; cursor: number }): void {
+    const ip = Number.isFinite(pos?.cursor) ? pos.cursor : -1;
+    let idx = -1;
+    if (pos?.cidr) idx = this.ranges.findIndex((r) => r.cidr === pos.cidr);
+    if (idx < 0 && ip >= 0) {
+      idx = this.ranges.findIndex((r) => {
+        const { start, end } = prefixToRange(r.cidr);
+        return ip >= start && ip <= end;
+      });
+    }
+    if (idx < 0) idx = 0;
+    this.rangeIdx = Math.min(idx, this.ranges.length);
     if (this.rangeIdx < this.ranges.length) {
       const { start, end } = prefixToRange(this.ranges[this.rangeIdx].cidr);
       this.cur = { start, end };
-      this.cursor = pos.cursor;
+      // SINIRLA: cursor aralığın dışındaysa kırp → prefix ıskalama/sapma olmaz.
+      this.cursor = Math.max(start - 1, Math.min(ip, end));
     } else {
       this.cur = null;
       this.cursor = -1;
