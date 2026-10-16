@@ -680,7 +680,26 @@ export async function runMassScan(
       }
     }
   });
-  await Promise.all(workers);
+  // WATCHDOG: bir worker/cihaz takılırsa döngü ASLA süresiz durmasın.
+  // Kanıt: 20:29'da cred fazında 3 SAAT takıldı — cursor @1319708607'de dondu,
+  // scan-total 200k arttı ama hiçbir döngü bitmedi. 5 dk sonra devam edilir.
+  const stuck = await Promise.race([
+    Promise.all(workers).then(() => false),
+    new Promise<boolean>((r) => {
+      const tm = setTimeout(() => r(true), 5 * 60_000);
+      tm.unref?.();
+    }),
+  ]);
+  if (stuck) {
+    try {
+      fs.appendFileSync(
+        path.join(app.getPath('userData'), 'scan.log'),
+        `${new Date().toISOString()} PHASE WATCHDOG cred-fazi-5dk-asti urlOk=${urlOk}\n`,
+      );
+    } catch {
+      /* noop */
+    }
+  }
 
   // HTTP/CVE ve proprietary taramalarını PARALEL koştur.
   // ⚠️ ÖLÇÜM: 533 cihazın 532'si port 554, 1'i 37777, 0'ı 80/8080/8000.
