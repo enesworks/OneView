@@ -22,6 +22,29 @@ export default function StreamOverlay({ camera, onClose }: Props) {
 
   useEffect(() => {
     let cancelled = false;
+    let attempt = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // Bir kamera BİR KEZ açıldıysa canlıdır → hata aldığında ölmemeli.
+    // Bayat/bozuk HLS oturumu (silinmiş segment, yeniden başlayan ffmpeg)
+    // en sık hata sebebi; çözüm: oturumu bırakıp TAZE oturum açmak.
+    function retrySession(): void {
+      if (cancelled) return;
+      hlsRef.current?.destroy();
+      hlsRef.current = null;
+      if (sessionRef.current) {
+        window.onView.streamRelease(sessionRef.current.sessionId);
+        sessionRef.current = null;
+      }
+      attempt += 1;
+      if (attempt > 3) {
+        setPhase('error');
+        setErrorMsg('Akış çözümlenemedi (3 deneme)');
+        return;
+      }
+      setPhase('loading');
+      retryTimer = setTimeout(() => void start(), 1200);
+    }
 
     async function start() {
       if (camera.status === 'offline') {
@@ -75,8 +98,9 @@ export default function StreamOverlay({ camera, onClose }: Props) {
                 hls.recoverMediaError();
                 return;
               }
-              setPhase('error');
-              setErrorMsg('Akış çözümlenemedi');
+              // FATAL ve toparlanamadı → kamera CANLI, biz açamadık. Taze oturumla
+              // yeniden bağlan (bayat playlist/segment en sık hata sebebi).
+              retrySession();
             });
           } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
             video.src = session.url;
@@ -92,13 +116,10 @@ export default function StreamOverlay({ camera, onClose }: Props) {
         video
           .play()
           .then(() => setPhase('playing'))
-          .catch(() => {
-            setPhase('error');
-            setErrorMsg('Oynatma başlatılamadı');
-          });
-      } catch (e) {
-        setPhase('error');
-        setErrorMsg(e instanceof Error ? e.message : 'Bağlantı hatası');
+          .catch(() => retrySession());
+      } catch {
+        // 'yayın açılamadı' gibi GEÇİCİ hatada da yeniden dene (kamera canlı olabilir).
+        retrySession();
       }
     }
 
@@ -112,6 +133,7 @@ export default function StreamOverlay({ camera, onClose }: Props) {
 
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
       clearInterval(keepAlive);
       hlsRef.current?.destroy();
       hlsRef.current = null;
