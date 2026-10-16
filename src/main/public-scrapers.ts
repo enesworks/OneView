@@ -33,6 +33,45 @@ function extractCoords(html: string): { lat: number; lon: number } | null {
   return null;
 }
 
+// JSON gövdesindeki kamera nesnelerini (url + lat/lon + name) çıkar.
+function extractCamObjects(body: string): Array<{ name: string; url: string; lat: number; lon: number }> {
+  const out: Array<{ name: string; url: string; lat: number; lon: number }> = [];
+  const re = /\{[^{}]*"(?:url|stream|streamUrl|stream_url|link|yayin|yayin_url)"\s*:\s*"(?:https?|rtsp):[^{}]*\}/gi;
+  for (const m of body.matchAll(re)) {
+    const chunk = m[0];
+    const url = /"(?:url|stream|streamUrl|stream_url|link|yayin|yayin_url)"\s*:\s*"([^"]+)"/i.exec(chunk)?.[1];
+    if (!url) continue;
+    const lat = Number(/"(?:lat|latitude|enlem)"\s*:\s*"?(-?\d{1,2}\.\d+)/i.exec(chunk)?.[1] || 0);
+    const lon = Number(/"(?:lon|lng|longitude|boylam)"\s*:\s*"?(-?\d{1,3}\.\d+)/i.exec(chunk)?.[1] || 0);
+    const name = /"(?:name|adi|ad|title|baslik|kamera|camera)"\s*:\s*"([^"]{2,60})"/i.exec(chunk)?.[1] || '';
+    out.push({
+      name,
+      url: url.replace(/\\\//g, '/'),
+      lat: Number.isFinite(lat) ? lat : 0,
+      lon: Number.isFinite(lon) ? lon : 0,
+    });
+  }
+  return out;
+}
+
+// Aday kamu kaynakları — İBB/KGM/belediye trafik yayınları + açık JSON uçları.
+const PUBLIC_SOURCES: Array<{ label: string; url: string; il: string }> = [
+  { label: 'İBB Trafik', url: 'https://api.ibb.gov.tr/trafik/v1/camera', il: 'İstanbul' },
+  { label: 'İBB Trafik', url: 'https://api.ibb.gov.tr/trafik/v1/cameras', il: 'İstanbul' },
+  { label: 'İBB Trafik', url: 'https://api.ibb.gov.tr/trafik/camera', il: 'İstanbul' },
+  { label: 'İBB Trafik', url: 'https://trafik.ibb.gov.tr/', il: 'İstanbul' },
+  { label: 'KGM', url: 'https://www.kgm.gov.tr/', il: 'Ankara' },
+  { label: 'KGM', url: 'https://www.kgm.gov.tr/api/cameras', il: 'Ankara' },
+  { label: 'Ankara BB', url: 'https://www.ankara.bel.tr/trafik-kameralari', il: 'Ankara' },
+  { label: 'İzmir BB', url: 'https://www.izmir.bel.tr/tr/CanliYayinlar', il: 'İzmir' },
+  { label: 'Bursa BB', url: 'https://www.bursa.bel.tr/canli-trafik-kamerasi', il: 'Bursa' },
+  { label: 'Antalya BB', url: 'https://www.antalya.bel.tr/trafik-kameralari', il: 'Antalya' },
+  { label: 'Kocaeli BB', url: 'https://www.kocaeli.bel.tr/trafik-kameralari', il: 'Kocaeli' },
+  { label: 'Gaziantep BB', url: 'https://www.gaziantep.bel.tr/trafik-kameralari', il: 'Gaziantep' },
+  { label: 'Konya BB', url: 'https://www.konya.bel.tr/trafik-kameralari', il: 'Konya' },
+  { label: 'Adana BB', url: 'https://www.adana.bel.tr/trafik-kameralari', il: 'Adana' },
+];
+
 async function geocodeName(name: string): Promise<{ lat: number; lon: number } | null> {
   try {
     const ctrl = new AbortController();
@@ -69,35 +108,37 @@ function toCam(name: string, url: string, lat = 0, lon = 0): RegisteredCamera {
   };
 }
 
-export async function ibbTraffic(): Promise<RegisteredCamera[]> {
+// Tüm kamu kaynaklarını tara — bağımsız, biri düşse diğerleri çalışır.
+export async function scrapePublic(): Promise<RegisteredCamera[]> {
   const out: RegisteredCamera[] = [];
-  const sources = ['https://trafik.ibb.gov.tr/', 'https://trafik.ibb.gov.tr/cctv'];
-  for (const src of sources) {
+  const seen = new Set<string>();
+  for (const src of PUBLIC_SOURCES) {
     try {
-      const html = await getText(src);
-      const geo = extractCoords(html) || (await geocodeName('İstanbul'));
-      const cams = extractM3u8(html);
-      for (const url of cams) out.push(toCam('IBB Trafik', url, geo?.lat ?? 0, geo?.lon ?? 0));
+      const body = await getText(src.url);
+      if (!body || body.length < 40) continue;
+      const geo = extractCoords(body) || (await geocodeName(src.il));
+      for (const o of extractCamObjects(body)) {
+        if (!o.url || seen.has(o.url)) continue;
+        seen.add(o.url);
+        out.push(toCam(o.name || src.label, o.url, o.lat || geo?.lat || 0, o.lon || geo?.lon || 0));
+      }
+      for (const url of extractM3u8(body)) {
+        if (seen.has(url)) continue;
+        seen.add(url);
+        out.push(toCam(src.label, url, geo?.lat ?? 0, geo?.lon ?? 0));
+      }
     } catch {
-      /* ignore — geo/token engelli olabilir */
+      /* kaynak düştü → sonraki */
     }
   }
   return out;
 }
 
+export async function ibbTraffic(): Promise<RegisteredCamera[]> {
+  return scrapePublic();
+}
+
 export async function kgmCameras(): Promise<RegisteredCamera[]> {
-  const out: RegisteredCamera[] = [];
-  const sources = ['https://www.kgm.gov.tr/Sayfalar/KGM/SiteTr/Trafik/CanliYayin.aspx'];
-  for (const src of sources) {
-    try {
-      const html = await getText(src);
-      const geo = extractCoords(html) || (await geocodeName('Ankara'));
-      const cams = extractM3u8(html);
-      for (const url of cams) out.push(toCam('KGM', url, geo?.lat ?? 0, geo?.lon ?? 0));
-    } catch {
-      /* ignore */
-    }
-  }
-  return out;
+  return [];
 }
 

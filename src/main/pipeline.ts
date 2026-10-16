@@ -14,7 +14,7 @@ import { runExploitChain } from './exploits';
 import { StreamEngine } from './stream';
 import { hikvisionLogin, dahuaLogin, hikvisionChannelCount, dahuaChannelCount } from './vendor-auth';
 import { discoverStreams } from './channels';
-import { ibbTraffic, kgmCameras } from './public-scrapers';
+import { scrapePublic } from './public-scrapers';
 import { GeoLocator } from './geoip';
 import { scanPort, quickRtsp, rtspAlive, rtspBanner, rtspVendor, MASS_CREDS } from './massscan';
 import { tryProprietaryAuth, dahuaRtspPath, hikRtspPath } from './proprietary';
@@ -789,7 +789,7 @@ export async function runVendorAuthExploit(store: CameraStore, registry: CameraR
 }
 
 export async function runPublicScrape(registry: CameraRegistry): Promise<number> {
-  const cams = [...(await ibbTraffic()), ...(await kgmCameras())];
+  const cams = await scrapePublic();
   let added = 0;
   for (const c of cams) {
     if (!registry.get(c.id)) {
