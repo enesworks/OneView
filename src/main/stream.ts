@@ -328,7 +328,8 @@ export class StreamEngine {
       this.release(oldest[0]);
     }
 
-    await this.waitForFile(out, 15000);
+    // 15sn YETMİYORDU: H.265/4K kamerada ilk segment gecikiyordu → "transcode timeout".
+    await this.waitForFile(out, 25000);
 
     return {
       sessionId,
@@ -368,12 +369,18 @@ export class StreamEngine {
     return [
       '-rtsp_transport', 'tcp',
       '-rtsp_flags', 'prefer_tcp',
+      '-timeout', '5000000', // 5sn soket timeout (µs) → yarı-ölü kamerada sonsuz takılma yok
+      '-analyzeduration', '1000000',
+      '-probesize', '500000',
       '-fflags', 'nobuffer',
       '-i', camera.url,
+      // ÖLÇÜLDÜ (ffmpeg testi): 3840x2160 → 1280x720. H.265/4K kamerada ultrafast bile
+      // ilk HLS segmentini 15sn'de yetiştiremiyordu → "transcode timeout". Gerçek çözüm bu.
+      '-vf', "scale='min(1280,iw)':-2",
       '-c:v', 'libx264',
       '-preset', 'ultrafast',
       '-tune', 'zerolatency',
-      '-g', '30',
+      '-g', '15',
       '-pix_fmt', 'yuv420p',
       '-an',
       ...hls,

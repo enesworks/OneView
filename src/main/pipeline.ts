@@ -165,6 +165,14 @@ function toRegistered(d: DeviceRecord): RegisteredCamera {
   };
 }
 
+// Türkiye sınır kutusu. Anahtar/API gerektirmez ve 91.184.0.0/13 gibi bloklarda
+// TR'ye ait OLMAYAN tahsisleri (Belçika/Rusya/İran/Polonya) kesin ayırır.
+// Konum bilinmiyorsa (0,0) eleme yapılmaz — İBB/UPnP kayıtları koordinatsız olabilir.
+function geoAllowed(lat: number, lon: number): boolean {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) return true;
+  return lat >= 35.5 && lat <= 42.5 && lon >= 25.5 && lon <= 45.0;
+}
+
 export function storeStats(store: CameraStore) {
   const all = store.listDevices();
   return {
@@ -394,10 +402,17 @@ export async function runThumbnails(store: CameraStore): Promise<number> {
 // TR evreni ~20M IP → bilinen bir cihazın TEKRAR taranması SAATLER alır. Bu
 // yüzden store'da kimlik tutmuş (url'li) cihazlar arayüze hiç düşmüyordu.
 export async function runRegistryBackfill(store: CameraStore, registry: CameraRegistry): Promise<number> {
+  // 1) YABANCI TEMİZLİĞİ: geo'su Türkiye dışındaki kayıtları arayüzden çıkar.
+  //    91.184.0.0/13 gibi bloklar TR'ye ait değil → Belçika/Rusya/İran çıkıyordu.
+  const dropped = registry.purge((c) => !geoAllowed(c.lat, c.lon));
+  if (dropped > 0) console.log(`[Backfill] ${dropped} yabancı kayıt arayüzden çıkarıldı`);
+
+  // 2) Store'daki bilinen (kimlik tutmuş) cihazları arayüze taşı.
   const fresh: RegisteredCamera[] = [];
   for (const d of store.listDevices()) {
     if (!d.url) continue;
     if (d.status !== 'LIVE' && d.status !== 'ACCESSIBLE') continue;
+    if (!geoAllowed(d.lat, d.lon)) continue;
     const cam = toRegistered(d);
     const cur = registry.get(cam.id);
     if (!cur) fresh.push(cam);
@@ -828,7 +843,11 @@ export async function runCleanup(store: CameraStore): Promise<number> {
     .listDevices()
     .filter((d) => web.has(d.port) && d.vendor === 'generic' && d.protocol !== 'rtsp');
   for (const d of targets) store.removeDevice(d.id);
-  return targets.length;
+  // YABANCI TEMİZLİĞİ: TR-only tarıyoruz ama eski kayıtlarda 91.184.0.0/13 gibi
+  // bloklardan Belçika/Rusya/İran cihazları kalmış. Kalıcı olarak DB'den düş.
+  const foreign = store.listDevices().filter((d) => !geoAllowed(d.lat, d.lon));
+  for (const d of foreign) store.removeDevice(d.id);
+  return targets.length + foreign.length;
 }
 
 function webPort(d: DeviceRecord): number {
