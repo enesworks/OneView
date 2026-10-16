@@ -34,7 +34,7 @@ async function drain(stream: ReadableStream<Uint8Array> | null, minBytes = 1): P
   }
 }
 
-export async function proveLive(url: string, protocol: string, timeoutMs = 6000): Promise<LiveProof> {
+export async function proveLive(url: string, protocol: string, timeoutMs = 12000): Promise<LiveProof> {
   const t0 = Date.now();
   if (!url) return { ok: false, latencyMs: 0, kind: 'no-url' };
   if (protocol === 'rtsp') return { ok: true, latencyMs: 0, kind: 'rtsp-describe' };
@@ -95,7 +95,7 @@ export async function proveLive(url: string, protocol: string, timeoutMs = 6000)
   }
 }
 
-export async function validateStream(url: string, protocol: string, timeoutMs = 6000): Promise<boolean> {
+export async function validateStream(url: string, protocol: string, timeoutMs = 12000): Promise<boolean> {
   return (await proveLive(url, protocol, timeoutMs)).ok;
 }
 

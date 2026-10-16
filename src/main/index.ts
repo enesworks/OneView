@@ -325,7 +325,9 @@ app.whenReady().then(() => {
   sources.load();
   geocoder.load();
   store = openStore(app.getPath('userData'));
-  registry.purge((c) => c.protocol === 'demo' || c.source === 'seed' || (c.source === 'scan' && c.status !== 'online'));
+  // ⚠️ Eskiden: source==='scan' && status!=='online' → TÜM keşfedilmiş kameralar
+  // her açılışta siliniyordu. Artık sadece url'siz/konumsuz junk temizlenir.
+  registry.purge((c) => c.protocol === 'demo' || c.source === 'seed' || (c.source === 'scan' && !c.url && c.status === 'unknown'));
   liveness.start();
   startAutopilot();
   createWindow();
