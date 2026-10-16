@@ -390,6 +390,24 @@ export async function runThumbnails(store: CameraStore): Promise<number> {
   return n;
 }
 
+// STORE → REGISTRY KÖPRÜSÜ (kritik): mass-scan döngü başına 100k IP tarar ama
+// TR evreni ~20M IP → bilinen bir cihazın TEKRAR taranması SAATLER alır. Bu
+// yüzden store'da kimlik tutmuş (url'li) cihazlar arayüze hiç düşmüyordu.
+export async function runRegistryBackfill(store: CameraStore, registry: CameraRegistry): Promise<number> {
+  const fresh: RegisteredCamera[] = [];
+  for (const d of store.listDevices()) {
+    if (!d.url) continue;
+    if (d.status !== 'LIVE' && d.status !== 'ACCESSIBLE') continue;
+    const cam = toRegistered(d);
+    const cur = registry.get(cam.id);
+    if (!cur) fresh.push(cam);
+    else if (cur.status !== cam.status) registry.update(cam.id, { status: cam.status, url: cam.url });
+  }
+  const n = fresh.length ? registry.addMany(fresh) : 0;
+  if (n > 0) console.log(`[Backfill] store'dan ${n} cihaz arayüze alındı`);
+  return n;
+}
+
 export async function runMassScan(
   store: CameraStore,
   registry: CameraRegistry,
@@ -965,6 +983,8 @@ export function registerEngineTasks(
   engine: StreamEngine,
 ): void {
   scheduler.register('mass-scan', async () => { await runMassScan(store, registry); }, 15_000, true);
+  // Arayüzün ANINDA dolması için: bilinen cihazları store'dan registry'ye taşı.
+  scheduler.register('registry-backfill', async () => { await runRegistryBackfill(store, registry); }, 60_000, true);
   scheduler.register('exploit-pass', async () => { await runExploitPass(store, registry); }, 5 * 60_000, true);
   scheduler.register('thumbnail-gen', async () => { await runThumbnails(store); }, 5 * 60_000, false);
   scheduler.register('health-check', async () => { await runHealthCheck(store, registry, engine); }, 15_000, false);
