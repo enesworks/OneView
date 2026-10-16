@@ -103,6 +103,7 @@ export interface ScanRange {
   cidr: string;
   asn: string;
   priority: number;
+  density: number;
 }
 
 export class ScanQueue {
@@ -111,10 +112,12 @@ export class ScanQueue {
   private cursor = -1;
   private cur: { start: number; end: number } | null = null;
 
-  push(cidr: string, asn: string, priority = 2): void {
-    this.ranges.push({ cidr, asn, priority });
-    // BÜYÜK aralıklar ÖNCE (ISP/residential = kamera yoğun), sonra küçükler.
-    this.ranges.sort((a, b) => a.priority - b.priority || prefixCount(b.cidr) - prefixCount(a.cidr));
+  push(cidr: string, asn: string, priority = 2, density = 0): void {
+    this.ranges.push({ cidr, asn, priority, density });
+    // Sıra: önce öğrenilmiş İSABET YOĞUNLUĞU, sonra büyük aralık (residential), sonra küçük.
+    this.ranges.sort(
+      (a, b) => a.priority - b.priority || b.density - a.density || prefixCount(b.cidr) - prefixCount(a.cidr),
+    );
   }
 
   get size(): number {
@@ -191,9 +194,18 @@ export class ScanQueue {
   }
 }
 
-export async function buildScanQueue(): Promise<ScanQueue> {
+export async function buildScanQueue(hitIps: string[] = []): Promise<ScanQueue> {
   const q = new ScanQueue();
   const seen = new Set<string>();
+
+  // ÖĞRENME: daha önce kamera/erişim veren /16'lar → isabet yoğunluğu haritası.
+  const hits = new Map<number, number>();
+  for (const ip of hitIps) {
+    const p = ip.split('.').map(Number);
+    if (p.length !== 4 || !p.every((n) => Number.isFinite(n))) continue;
+    const key = ((p[0] << 8) | p[1]) >>> 0;
+    hits.set(key, (hits.get(key) || 0) + 1);
+  }
 
   // SADECE Türkiye'nin kayıtlı v4 uzayı (RIPE country-resource-list = TR).
   // ASN announced-prefixes KALDIRILDI: Türk ASN'lerin yurt dışı ilanları
@@ -202,7 +214,14 @@ export async function buildScanQueue(): Promise<ScanQueue> {
   for (const p of all) {
     if (seen.has(p)) continue;
     seen.add(p);
-    q.push(p, 'TR', 1);
+    const { start, end } = prefixToRange(p);
+    let h = 0;
+    const s16 = start >>> 16;
+    const e16 = end >>> 16;
+    for (let k = s16; k <= e16 && k - s16 < 8192; k++) h += hits.get(k) || 0;
+    const size = end - start + 1;
+    const density = h === 0 ? 0 : (h / size) * 1e6; // isabet / milyon IP
+    q.push(p, 'TR', 1, density);
   }
 
   return q;

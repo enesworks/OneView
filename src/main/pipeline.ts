@@ -331,7 +331,12 @@ export async function runMassScan(
   registry: CameraRegistry,
   ipBudget = 100000,
 ): Promise<number> {
-  const q = await buildScanQueue();
+  // ADAPTİF KUYRUK: daha önce kamera/erişim veren IP'lerin bölgelerini öne al.
+  const hitIps = store
+    .listDevices()
+    .filter((d) => d.status === 'LIVE' || d.status === 'ACCESSIBLE')
+    .map((d) => d.ip);
+  const q = await buildScanQueue(hitIps);
   // Kuyruk şeması değişti (TR-only) → eski cursor geçersiz, baştan başla.
   const QUEUE_VER = 'tr-v3';
   if (store.getMeta('queue-ver') !== QUEUE_VER) {

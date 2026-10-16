@@ -283,6 +283,25 @@ const QUICK_PATHS = [
   '/realmonitor?channel=1&subtype=0',
 ];
 
+// ÖĞRENME: tutan path'ler öne alınır (oturum içi, anahtar/dosya gerekmez).
+const HOT_PATHS: string[] = [];
+function orderedPaths(): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of [...HOT_PATHS, ...QUICK_PATHS]) {
+    if (seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out;
+}
+function rememberPath(path: string): void {
+  const i = HOT_PATHS.indexOf(path);
+  if (i >= 0) HOT_PATHS.splice(i, 1);
+  HOT_PATHS.unshift(path);
+  if (HOT_PATHS.length > 20) HOT_PATHS.pop();
+}
+
 export const QUICK_CREDS: Array<[string, string]> = [
   ['', ''],
   ['admin', '12345'],
@@ -356,8 +375,9 @@ export async function quickRtsp(host: string, port = 554, timeoutMs = 2000): Pro
       if (res !== 'deny') break;
     }
     if (res === 'ok') {
-      for (const path of QUICK_PATHS) {
+      for (const path of orderedPaths()) {
         if (await rtspTry(host, port, path, u, p, timeoutMs)) {
+          rememberPath(path);
           const authPart = u ? `${encodeURIComponent(u)}:${encodeURIComponent(p)}@` : '';
           return { url: `rtsp://${authPart}${host}:${port}${path}`, user: u, pass: p };
         }
