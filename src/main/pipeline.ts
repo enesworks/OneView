@@ -569,6 +569,16 @@ export async function runMassScan(
   const openIps = openTargets;
   // Kanıt: bulunan açık RTSP sayısı (kümülatif) — arayüzde canlı görünür.
   store.setMeta('scan-open', String(Number(store.getMeta('scan-open') || '0') + openIps.length));
+  // FAZ KALP ATIŞI: scan.log eskiden yalnızca döngü SONUNDA yazılıyordu → hangi
+  // fazda takıldığı görünmüyordu (4 saat kör kaldık). Artık her faz işaretlenir.
+  try {
+    fs.appendFileSync(
+      path.join(app.getPath('userData'), 'scan.log'),
+      `${new Date().toISOString()} PHASE port-tarama-bitti rtspAcik=${openIps.length}\n`,
+    );
+  } catch {
+    /* noop */
+  }
   let live = 0;
   let urlOk = 0;
   let idx = 0;
@@ -673,9 +683,22 @@ export async function runMassScan(
   await Promise.all(workers);
 
   // HTTP/CVE ve proprietary taramalarını PARALEL koştur.
+  // ⚠️ ÖLÇÜM: 533 cihazın 532'si port 554, 1'i 37777, 0'ı 80/8080/8000.
+  // Bu iki tarama her döngüde 80/8080/37777/8000'i 100k IP'de tarıyordu =
+  // döngü süresinin ~yarısı, karşılığı ~0 cihaz (TR'de bu portlar kapalı).
+  // %5 örneklemeye indiriyoruz: yetenek kalır, maliyet 20x düşer.
+  try {
+    fs.appendFileSync(
+      path.join(app.getPath('userData'), 'scan.log'),
+      `${new Date().toISOString()} PHASE cred-fazi-bitti urlOk=${urlOk} live=${live}\n`,
+    );
+  } catch {
+    /* noop */
+  }
+  const sampleIps = ips.slice(0, 5000);
   const [cveLive, propLive] = await Promise.all([
-    httpCveScan(store, registry, ips),
-    proprietaryScan(store, registry, ips),
+    httpCveScan(store, registry, sampleIps),
+    proprietaryScan(store, registry, sampleIps),
   ]);
   live += cveLive + propLive;
 
