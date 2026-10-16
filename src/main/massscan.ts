@@ -342,9 +342,9 @@ function rememberRealm(realm: string, u: string, p: string): void {
   REALM_CREDS.set(realm, list);
 }
 
-// GERÇEK doğrulama: DESCRIBE 200+SDP bile yanıltıcı çıkıyor (kanıt: 78.161.95.254
-// DESCRIBE'da SDP döndü ama ffmpeg'de "SETUP failed: 404 Stream Not Found").
-// SETUP 200/461 = stream gerçekten var ve oynatılabilir (ffmpeg'in ilk adımı).
+// SETUP: önce TCP, olmazsa UDP. Bazı (özellikle eski) cihazlar "RTP/AVP/TCP;
+// interleaved" transport'unu desteklemez → eski hâlde çalışan kamera "path yok"
+// sanılıp ELENİRDİ (yanlış negatif). UDP client_port ile tekrar denenir.
 function rtspSetupOk(
   host: string,
   port: number,
@@ -352,6 +352,23 @@ function rtspSetupOk(
   user: string,
   pass: string,
   timeoutMs = 2500,
+): Promise<boolean> {
+  return setupWith(host, port, path, user, pass, 'RTP/AVP/TCP;unicast;interleaved=0-1', timeoutMs).then((ok) =>
+    ok ? true : setupWith(host, port, path, user, pass, 'RTP/AVP;unicast;client_port=8000-8001', timeoutMs),
+  );
+}
+
+// GERÇEK doğrulama: DESCRIBE 200+SDP bile yanıltıcı çıkıyor (kanıt: 78.161.95.254
+// DESCRIBE'da SDP döndü ama ffmpeg'de "SETUP failed: 404 Stream Not Found").
+// SETUP 200/461 = stream gerçekten var ve oynatılabilir (ffmpeg'in ilk adımı).
+function setupWith(
+  host: string,
+  port: number,
+  path: string,
+  user: string,
+  pass: string,
+  transport: string,
+  timeoutMs: number,
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const s = new net.Socket();
@@ -370,7 +387,7 @@ function rtspSetupOk(
     s.setNoDelay(true);
     s.setTimeout(timeoutMs, () => fin(false));
     s.once('connect', () => {
-      let req = `SETUP rtsp://${host}:${port}${path} RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nUser-Agent: OneView/2.0\r\n`;
+      let req = `SETUP rtsp://${host}:${port}${path} RTSP/1.0\r\nCSeq: 1\r\nTransport: ${transport}\r\nUser-Agent: OneView/2.0\r\n`;
       if (user) req += `Authorization: ${basicAuth(user, pass)}\r\n`;
       req += '\r\n';
       s.write(req);
