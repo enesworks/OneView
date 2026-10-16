@@ -370,6 +370,8 @@ export async function runHealthCheck(
     .filter((c) => c.url && c.protocol !== 'demo')
     .slice(0, 24); // tüm kayıtlar her turda test edilsin (öncelikli slot + 2 paralel)
   const now = Date.now();
+  let okN = 0;
+  let badN = 0;
   let idx = 0;
   const workers = Array.from({ length: Math.min(2, Math.max(targets.length, 1)) }, async () => {
     while (idx < targets.length) {
@@ -391,6 +393,7 @@ export async function runHealthCheck(
           ? await verifyStream(c.url, 12000, true)
           : await validateStream(c.url, c.protocol, 12000);
       if (plays) {
+        okN++;
         offlineSince.delete(c.id);
         offlineFail.delete(c.id);
         if (d) store.setDeviceStatus(d.id, 'LIVE', now);
@@ -412,6 +415,16 @@ export async function runHealthCheck(
     }
   });
   await Promise.all(workers);
+  // ÖLÇÜM: her health-check turu log'a yazılır → "4 kamera oynuyor ama online
+  // görünmüyor" gibi çelişkileri bir daha tahmin etmeyiz.
+  try {
+    fs.appendFileSync(
+      path.join(app.getPath('userData'), 'scan.log'),
+      `${new Date().toISOString()} PHASE health-check hedef=${targets.length} online=${okN} basarisiz=${targets.length - okN}\n`,
+    );
+  } catch {
+    /* noop */
+  }
   registry.save();
 }
 
@@ -476,7 +489,12 @@ export async function runRegistryBackfill(store: CameraStore, registry: CameraRe
     const cam = toRegistered(d);
     const cur = registry.get(cam.id);
     if (!cur) fresh.push(cam);
-    else if (cur.status !== cam.status) registry.update(cam.id, { status: cam.status, url: cam.url });
+    // ⚠️ SADECE YÜKSELT, ASLA DÜŞÜRME: store'daki bayat OFFLINE durumu, health-check'in
+    // doğrulayıp 'online' yaptığı kaydı her 60 sn'de geri 'offline' yapıyordu.
+    // İki görev birbirini eziyordu → 4 oynayan kamera listede ÇEVRİMDIŞI görünüyordu.
+    else if (cam.status === 'online' && cur.status !== 'online') {
+      registry.update(cam.id, { status: 'online', url: cam.url });
+    }
   }
   const n = fresh.length ? registry.addMany(fresh) : 0;
   if (n > 0) console.log(`[Backfill] store'dan ${n} cihaz arayüze alındı`);
