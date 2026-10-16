@@ -383,8 +383,8 @@ export async function runHealthCheck(
       }
       const plays =
         c.protocol === 'rtsp'
-          ? await verifyStream(c.url, 6000)
-          : await validateStream(c.url, c.protocol, 6000);
+          ? await verifyStream(c.url, 12000)
+          : await validateStream(c.url, c.protocol, 12000);
       if (plays) {
         offlineSince.delete(c.id);
         offlineFail.delete(c.id);
@@ -398,8 +398,11 @@ export async function runHealthCheck(
         const since = offlineSince.get(c.id) || now;
         offlineSince.set(c.id, since);
         if (d) store.setDeviceStatus(d.id, now - since > 5 * 60_000 ? 'DEAD' : 'OFFLINE', now);
-        // Registry'de yalnızca oynayan kameralar kalır (store'da kayıt kalır).
-        registry.purge((x) => x.id === c.id);
+        // url'i olan kayıt ARAYÜZDE KALIR (kırmızı/offline) ve 60sn sonra tekrar
+        // denenir. Eskiden burada siliniyordu → kamera bir kez yanlış "offline"
+        // damgası yiyince listeden tamamen kayboluyordu ("arayüzde hiç kamera yok").
+        if (c.url) registry.update(c.id, { status: 'offline', lastSeen: now });
+        else registry.purge((x) => x.id === c.id);
       }
     }
   });
@@ -442,7 +445,10 @@ export async function runRegistryBackfill(store: CameraStore, registry: CameraRe
   const byId = new Map(store.listDevices().map((d) => [d.id, d]));
   const deadN = registry.purge((c) => {
     const d = byId.get(c.id);
-    return !!d && (d.status === 'OFFLINE' || d.status === 'DEAD');
+    // ⚠️ url'i OLAN cihaz arayüzden ATILMAZ: sadece gri (unknown) olur. Eskiden
+    // OFFLINE işaretlenen her kayıt siliniyordu → çalışan kamera bir kez
+    // yanlış "offline" damgası yiyince listeden tamamen kayboluyordu.
+    return !!d && !d.url && (d.status === 'OFFLINE' || d.status === 'DEAD');
   });
   if (deadN > 0) console.log(`[Backfill] ${deadN} ölü kayıt arayüzden çıkarıldı`);
 
@@ -457,7 +463,10 @@ export async function runRegistryBackfill(store: CameraStore, registry: CameraRe
   const fresh: RegisteredCamera[] = [];
   for (const d of store.listDevices()) {
     if (!d.url) continue;
-    if (d.status !== 'LIVE' && d.status !== 'ACCESSIBLE') continue;
+    // DURUM FİLTRESİ YOK: url'i olan her cihaz arayüze girer (gri/unknown).
+    // Yeşile dönmesi için health-check'in gerçek oynatma testinden geçmesi gerekir.
+    // (Eskiden yalnız LIVE/ACCESSIBLE alınıyordu; 12 cihazın hepsi OFFLINE olduğu
+    //  için liste BOŞ kalıyordu.)
     if (!geoAllowed(d.lat, d.lon)) continue;
     const cam = toRegistered(d);
     const cur = registry.get(cam.id);
