@@ -366,11 +366,15 @@ export class StreamEngine {
 
   private buildFfmpegArgs(camera: CameraDescriptor, out: string): string[] {
     const seg = path.join(path.dirname(out), 'seg-%d.ts');
+    // ⚠️ KRİTİK: eskiden hls_time=1 + list_size=4 (4sn pencere) idi; oynatıcı
+    // liveSyncDurationCount=3 ile 3 segment geride durur → en ufak takılmada 5.
+    // segmenti ister, silinmiştir → 404 → "Akış çözümlenemedi" (oynayıp ölüyordu).
     const hls: string[] = [
       '-f', 'hls',
-      '-hls_time', '1',
-      '-hls_list_size', '4',
-      '-hls_flags', 'delete_segments+append_list',
+      '-hls_time', '2', // 1 → 2
+      '-hls_list_size', '12', // 4 → 12 (~24sn pencere)
+      '-hls_flags', 'delete_segments+append_list+omit_endlist',
+      '-hls_delete_threshold', '4', // silmeden önce 4 segment tolerans
       '-hls_segment_filename', seg,
       out,
     ];

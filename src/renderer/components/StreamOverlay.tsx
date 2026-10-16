@@ -48,15 +48,35 @@ export default function StreamOverlay({ camera, onClose }: Props) {
 
         if (session.type === 'hls' || session.protocol === 'hls') {
           if (Hls.isSupported()) {
-            const hls = new Hls({ lowLatencyMode: true, liveSyncDurationCount: 3 });
+            // lowLatencyMode KAPALI: LL-HLS (PART) beklemiyoruz, açıkken oynatıcı
+            // canlı kenara fazla yaklaşıp silinmiş segmenti isteyip 404 alıyordu.
+            const hls = new Hls({
+              liveSyncDurationCount: 3,
+              maxBufferLength: 12,
+              liveDurationInfinity: true,
+              manifestLoadingTimeOut: 15000,
+              levelLoadingTimeOut: 15000,
+              fragLoadingTimeOut: 25000,
+              manifestLoadingMaxRetry: 6,
+              levelLoadingMaxRetry: 6,
+              fragLoadingMaxRetry: 8,
+            });
             hlsRef.current = hls;
             hls.loadSource(session.url);
             hls.attachMedia(video);
             hls.on(Hls.Events.ERROR, (_e, data) => {
-              if (data.fatal) {
-                setPhase('error');
-                setErrorMsg('Akış çözümlenemedi');
+              if (!data.fatal) return;
+              // GEÇİCİ hatalarda ölme — otomatik toparlan (oynatma sürsün).
+              if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                hls.startLoad();
+                return;
               }
+              if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                hls.recoverMediaError();
+                return;
+              }
+              setPhase('error');
+              setErrorMsg('Akış çözümlenemedi');
             });
           } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
             video.src = session.url;
