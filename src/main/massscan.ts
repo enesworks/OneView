@@ -479,6 +479,7 @@ export async function quickRtsp(
 
   let tries = 0;
   let consecutiveNone = 0;
+  let pathFail = 0; // DESCRIBE-ok ama SETUP-path tutmadı sayacı
   for (const [u, p] of ordered) {
     if (tries >= MAX_CRED_TRIES || consecutiveNone >= 5) break;
     if (Date.now() - t0 > 90_000) break; // cihaz başına 90sn sert sınır — döngü kilitlenmesin
@@ -495,12 +496,11 @@ export async function quickRtsp(
     if (res === 'ok') {
       rememberRealm(rl, u, p);
       const authPart = u ? `${encodeURIComponent(u)}:${encodeURIComponent(p)}@` : '';
-      // ⚠️ SETUP denemeleri KISITLI. Eskiden her cred için 3 PROBE + TÜM öğrenilmiş
-      // path'ler denenip her biri 2.5sn sürüyordu → cihaz başına 30-40 DAKİKA.
-      // Döngü saatlerce kilitleniyordu (2 saat açık = 0 yeni kamera!). Kanıt:
-      // scan.log 17:50'de durdu, scan-total 2 saatte 100k ilerledi.
-      // Artık: en fazla 5 SETUP × 1.2sn + cihaz başına 60sn sert sınır.
-      const cands = [...PROBE, ...orderedPaths().slice(0, 2)];
+      // DESCRIBE 200+SDP = CRED GEÇERLİ, yalnız path tutmadı. Bu yüzden
+      // consecutiveNone'u ARTIRMIYORUZ — eskiden 5'te döngü kırılıyor ve geçerli
+      // şifreye rağmen cihaz tamamen eleniyordu (kanıt: urlOk=0, canlı cihazlarda).
+      // Bunun yerine daha çok path dene; pathFail sınırıyla cihazı bırak.
+      const cands = [...PROBE, ...orderedPaths().slice(0, 6)];
       for (const path of cands) {
         if (Date.now() - t0 > 60_000) break; // cihazı bırak, sıradakine geç
         if (await rtspSetupOk(host, port, path, u, p, 1200)) {
@@ -508,8 +508,8 @@ export async function quickRtsp(
           return { url: `rtsp://${authPart}${host}:${port}${path}`, user: u, pass: p };
         }
       }
-      // SETUP hiç tutmadı → sahte pozitif. Kaydetme, sonraki cred'e geç.
-      consecutiveNone++;
+      pathFail++;
+      if (pathFail >= 12) break; // path şeması çözülemedi → bu cihazı bırak
       continue;
     }
     if (res === 'none') consecutiveNone++;
